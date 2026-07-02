@@ -19,18 +19,14 @@ def get_ticker_data(ticker: str):
     return closing
 
 @app.function()
-def train_model(ticker: str, steps: int, media_movil: int):
-    datos = get_ticker_data.local(ticker)
+def train_model(datos, ticker: str, steps: int, media_movil: int):
     serie = pd.Series(datos)
     modelo = ARIMA(serie, order=(1, 1, media_movil))
 
-    # 3. Ajustar el modelo
     resultado = modelo.fit()
 
-    # 4. Ver el resumen estadístico
     print(resultado.summary())
 
-    # 5. Hacer un pronóstico para los siguientes 3 pasos
     pronostico = resultado.forecast(steps=steps)
     return pronostico
 
@@ -38,4 +34,7 @@ def train_model(ticker: str, steps: int, media_movil: int):
 @app.function(image=image)
 @modal.fastapi_endpoint()
 def main(ticker: str):
-    return {"prediction": train_model.local(ticker, 1, 50).to_list()}
+    datos = get_ticker_data.local(ticker)
+    return {"prediction": train_model.local(datos, ticker, 3, 50).to_list(),
+    "valor_actual": datos[-1],
+    "cant_predicciones": 3}
