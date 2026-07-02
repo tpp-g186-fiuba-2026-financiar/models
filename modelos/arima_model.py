@@ -33,8 +33,8 @@ def train_model(datos, ticker: str, steps: int, media_movil: int):
 
 @app.function(image=image)
 @modal.fastapi_endpoint()
-def main(ticker: str):
+def main(ticker: str, predictions: int, media_movil: int = 20):
     datos = get_ticker_data.local(ticker)
-    return {"prediction": train_model.local(datos, ticker, 3, 50).to_list(),
+    return {"prediction": train_model.local(datos, ticker, predictions, media_movil).to_list(),
     "valor_actual": datos[-1],
-    "cant_predicciones": 3}
+    "cant_predicciones": predictions}
