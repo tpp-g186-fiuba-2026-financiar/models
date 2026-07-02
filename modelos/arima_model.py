@@ -20,7 +20,7 @@ def get_ticker_data(ticker: str):
 
 @app.function()
 def train_model(ticker: str):
-    datos = [10, 12, 14, 15, 18, 20, 22, 25, 28, 30]
+    datos = get_ticker_data.local(ticker)
     serie = pd.Series(datos)
 
     # 2. Definir el modelo ARIMA con los parámetros (p, d, q)
@@ -35,9 +35,10 @@ def train_model(ticker: str):
 
     # 5. Hacer un pronóstico para los siguientes 3 pasos
     pronostico = resultado.forecast(steps=1)
+    return pronostico
 
 
 @app.function(image=image)
 @modal.fastapi_endpoint()
 def main(ticker: str):
-    return {"prediction": train_model.local(ticker).to_dict()}
+    return {"prediction": train_model.local(ticker).to_list()[0]}
