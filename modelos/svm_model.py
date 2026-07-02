@@ -53,7 +53,7 @@ def main(ticker: str):
     model = train_classifier.local(X, y)
     df['Predicted_Signal'] = model.predict(X)
 
-    if df.iloc[-1]['Predicted_Signal'] == 1:
+    if df.iloc[-1]['Predicted_Signal'] == 0:
         return {"prediction": "Buy"}
     else:
         return {"prediction" : "Sell"}
