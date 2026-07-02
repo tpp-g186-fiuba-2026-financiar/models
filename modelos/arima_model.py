@@ -9,7 +9,7 @@ from statsmodels.tsa.arima.model import ARIMA
 REG = None
 
 image = modal.Image.debian_slim().pip_install("fastapi[standard]", "arch", "pandas" ,"numpy", "requests", "statsmodels")
-app = modal.App("garch-model")
+app = modal.App("arima-model")
 
 @app.function()
 def get_ticker_data(ticker: str):
@@ -19,13 +19,10 @@ def get_ticker_data(ticker: str):
     return closing
 
 @app.function()
-def train_model(ticker: str):
+def train_model(ticker: str, steps: int, media_movil: int):
     datos = get_ticker_data.local(ticker)
     serie = pd.Series(datos)
-
-    # 2. Definir el modelo ARIMA con los parámetros (p, d, q)
-    # p = retardo autorregresivo, d = diferenciación, q = media móvil
-    modelo = ARIMA(serie, order=(1, 1, 1))
+    modelo = ARIMA(serie, order=(1, 1, media_movil))
 
     # 3. Ajustar el modelo
     resultado = modelo.fit()
@@ -34,11 +31,11 @@ def train_model(ticker: str):
     print(resultado.summary())
 
     # 5. Hacer un pronóstico para los siguientes 3 pasos
-    pronostico = resultado.forecast(steps=1)
+    pronostico = resultado.forecast(steps=steps)
     return pronostico
 
 
 @app.function(image=image)
 @modal.fastapi_endpoint()
 def main(ticker: str):
-    return {"prediction": train_model.local(ticker).to_list()[0]}
+    return {"prediction": train_model.local(ticker, 1, 50).to_list()}
