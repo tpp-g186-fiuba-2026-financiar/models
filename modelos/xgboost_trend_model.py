@@ -19,9 +19,11 @@ import requests
 image = (
     modal.Image.debian_slim()
     # xgboost necesita OpenMP en runtime (mismo motivo por el que el
-    # Dockerfile de api-ml instala libgomp1).
+    # Dockerfile de api-ml instala libgomp1). Las versiones nuevas de
+    # xgboost (3.x) ademas requieren scikit-learn instalado para poder usar
+    # la API sklearn-compatible (XGBRegressor), aunque no se importe directo.
     .apt_install("libgomp1")
-    .pip_install("fastapi[standard]", "xgboost", "numpy", "pandas", "requests")
+    .pip_install("fastapi[standard]", "xgboost", "scikit-learn", "numpy", "pandas", "requests")
 )
 app = modal.App("xgboost-trend-model")
 
