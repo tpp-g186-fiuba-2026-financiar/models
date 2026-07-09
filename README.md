@@ -24,3 +24,24 @@ Si se esta corriendo con serve se puede acceder en la ruta:
 https://financiar186--example-get-started-main-dev.modal.run/?x=10
 ```
 Donde x es el parametro de la funcion
+
+## Modelos de tendencia (LSTM / XGBoost)
+
+`modelos/lstm_trend_model.py` y `modelos/xgboost_trend_model.py` son
+reimplementaciones independientes de los modelos de tendencia de `api-ml`
+(mismas features, mismo target). Igual que el resto de `modelos/*.py`
+(arima/garch/svm): archivo autocontenido, entrena on-demand solo con el
+ticker pedido via `data-colector`, sin pooling entre tickers ni artefactos
+persistidos -- asi no dependen de que el servicio de `api-ml` en Render
+este arriba.
+
+```
+modal serve modelos/lstm_trend_model.py
+modal serve modelos/xgboost_trend_model.py
+```
+
+Se consultan con el ticker como parametro:
+```
+https://financiar186--lstm-trend-model-main-dev.modal.run/?ticker=GGAL
+https://financiar186--xgboost-trend-model-main-dev.modal.run/?ticker=GGAL
+```
