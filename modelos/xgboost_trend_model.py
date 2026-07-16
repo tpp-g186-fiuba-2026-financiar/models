@@ -1,10 +1,11 @@
 """Modelo XGBoost de tendencia, portado a Modal desde api-ml.
 
 Mismo criterio que `lstm_trend_model.py` en este mismo directorio: misma
-logica de features/target que `api-ml/src/xgb_trend.py`, entrenado
-on-demand con los datos del ticker pedido -- igual que el resto de
-`modelos/*.py` en este repo (arima/garch/svm), sin pooling entre tickers
-ni artefactos persistidos.
+logica de features/target que `api-ml/src/xgb_trend.py` (retornos log de
+precio/volumen + rango %, indicadores tecnicos -- RSI/SMA/MACD/momentum -- y
+una tasa de interes exogena), entrenado on-demand con los datos del ticker
+pedido -- igual que el resto de `modelos/*.py` en este repo (arima/garch/svm),
+sin pooling entre tickers ni artefactos persistidos.
 
 Si se cambia la logica en api-ml hay que replicarla aca a mano -- es una
 copia independiente a proposito, para que esto funcione aunque el
@@ -28,10 +29,26 @@ image = (
 app = modal.App("xgboost-trend-model")
 
 DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
-FEATURE_NAMES = ["log_return", "log_volume_change", "range_pct"]
+FEATURE_NAMES = [
+    "log_return",
+    "log_volume_change",
+    "range_pct",
+    "rsi_norm",
+    "sma20_ratio",
+    "macd_norm",
+    "momentum_10",
+    "macro_rate_chg5",
+]
 WINDOW = 30
 HORIZON = 5
 NEUTRAL_BAND = 0.01
+# Tasa de interes exogena (ver `fetch_macro_series`): rendimiento a 10 anios
+# del Tesoro de EEUU, proxy de apetito por riesgo global que afecta flujos a
+# mercados emergentes (Merval incluido). La alternativa local mas relevante
+# para acciones argentinas (BCRA: source="ar", series="TPM") dependia de una
+# API que estaba caida del lado de data-colector al portar esta feature.
+MACRO_RATE_SOURCE = "us"
+MACRO_RATE_SERIES = "TNX"
 
 
 def fetch_ticker_history(ticker: str) -> pd.DataFrame:
@@ -53,7 +70,105 @@ def fetch_ticker_history(ticker: str) -> pd.DataFrame:
     return frame.sort_index()
 
 
+def fetch_macro_series(source: str = MACRO_RATE_SOURCE, series: str = MACRO_RATE_SERIES):
+    """Serie de tasa de interes exogena (identico a `api-ml/src/data.py`).
+
+    `data-colector` responde siempre HTTP 200 y codifica el error real en el
+    body (``{"status": 500, "message": {...}}``) en vez de usar el status
+    code -- pasa justo con el endpoint de BCRA (``ar``/``TPM``) -- por eso se
+    valida ``payload["status"]`` ademas de ``raise_for_status()``. Nunca
+    propaga la excepcion: si falla, se loguea y se sigue sin esta feature
+    (queda en 0 via ``nan_to_num`` en ``build_features``) en vez de romper
+    la prediccion por una serie opcional.
+    """
+    try:
+        resp = requests.post(f"{DATA_COLLECTOR_URL}/interest-rate/{source}/{series}", timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("status") != 200:
+            reason = (payload.get("message") or {}).get("error", "error desconocido")
+            raise ValueError(f"data-colector no pudo obtener {source}/{series}: {reason}")
+        rows = payload.get("data") or []
+        if not rows:
+            raise ValueError(f"data-colector no devolvio datos para {source}/{series}")
+        values = pd.Series(
+            [float(r["value"]) for r in rows],
+            index=pd.to_datetime([int(r["ts"]) for r in rows], unit="ms"),
+        )
+        return values[~values.index.duplicated(keep="last")].sort_index()
+    except Exception as exc:  # noqa: BLE001 - feature opcional, no debe romper la prediccion
+        print(f"  [warn] no se pudo obtener la serie macro ({source}/{series}): {exc}")
+        return None
+
+
+def attach_macro_feature(df: pd.DataFrame, macro) -> pd.DataFrame:
+    """Alinea la serie macro al indice de `df` (ffill, nunca un valor futuro)."""
+    df = df.copy()
+    if macro is None or macro.empty:
+        df["macro_rate"] = float("nan")
+        return df
+    df["macro_rate"] = macro.reindex(df.index, method="ffill")
+    return df
+
+
+def rsi_series(close: np.ndarray, period: int = 14) -> np.ndarray:
+    """RSI de Wilder, alineado a `close` (NaN en las primeras `period` posiciones)."""
+    n = len(close)
+    out = np.full(n, np.nan)
+    if n < period + 1:
+        return out
+
+    delta = np.diff(close)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+
+    def _rsi_from_averages(avg_gain: float, avg_loss: float) -> float:
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    avg_gain = gain[:period].mean()
+    avg_loss = loss[:period].mean()
+    out[period] = _rsi_from_averages(avg_gain, avg_loss)
+    for i in range(period, len(delta)):
+        avg_gain = (avg_gain * (period - 1) + gain[i]) / period
+        avg_loss = (avg_loss * (period - 1) + loss[i]) / period
+        out[i + 1] = _rsi_from_averages(avg_gain, avg_loss)
+    return out
+
+
+def sma(values: np.ndarray, window: int) -> np.ndarray:
+    """Media movil simple, alineada (NaN en las primeras `window - 1` posiciones)."""
+    n = len(values)
+    out = np.full(n, np.nan)
+    if n < window:
+        return out
+    cumsum = np.cumsum(np.insert(values, 0, 0.0))
+    out[window - 1 :] = (cumsum[window:] - cumsum[:-window]) / window
+    return out
+
+
+def ema(values: np.ndarray, span: int) -> np.ndarray:
+    """Media movil exponencial, alineada (arranca en el primer valor, sin NaN)."""
+    alpha = 2.0 / (span + 1.0)
+    out = np.empty(len(values), dtype=np.float64)
+    out[0] = values[0]
+    for i in range(1, len(values)):
+        out[i] = alpha * values[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def macd_histogram(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> np.ndarray:
+    """Histograma MACD (linea MACD menos su EMA de senal), alineado a `close`."""
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = ema(macd_line, signal)
+    return macd_line - signal_line
+
+
 def build_features(df: pd.DataFrame, horizon: int = HORIZON):
+    """Identico a `api-ml/src/lstm.py::build_features` (LSTM/XGBoost/Transformer
+    en api-ml comparten el mismo feature engineering)."""
     close = df["close"].to_numpy(dtype=np.float64)
     volume = df["volume"].to_numpy(dtype=np.float64)
     high = df["high"].to_numpy(dtype=np.float64)
@@ -65,7 +180,31 @@ def build_features(df: pd.DataFrame, horizon: int = HORIZON):
     log_volume_change = np.diff(np.log(safe_vol))
     range_pct = ((high - low) / np.where(close == 0, np.nan, close))[1:]
 
-    feats = np.column_stack([log_return, log_volume_change, range_pct])
+    rsi_norm = (rsi_series(close) - 50.0) / 50.0
+    sma20_ratio = close / sma(close, 20) - 1.0
+    macd_norm = macd_histogram(close) / np.where(close == 0, np.nan, close)
+    momentum_10 = np.full(len(close), np.nan)
+    momentum_10[10:] = log_close[10:] - log_close[:-10]
+
+    if "macro_rate" in df.columns:
+        macro_rate = df["macro_rate"].to_numpy(dtype=np.float64)
+    else:
+        macro_rate = np.full(len(close), np.nan)
+    macro_chg5 = np.full(len(close), np.nan)
+    macro_chg5[5:] = macro_rate[5:] - macro_rate[:-5]
+
+    feats = np.column_stack(
+        [
+            log_return,
+            log_volume_change,
+            range_pct,
+            rsi_norm[1:],
+            sma20_ratio[1:],
+            macd_norm[1:],
+            momentum_10[1:],
+            macro_chg5[1:],
+        ]
+    )
 
     n_feats = len(feats)
     target = np.full(n_feats, np.nan)
@@ -99,20 +238,11 @@ def flatten_windows(feats: np.ndarray, target: np.ndarray, window: int):
 
 
 def rsi(close: np.ndarray, period: int = 14):
-    if len(close) < period + 1:
+    """RSI de Wilder sobre el ultimo valor de la serie (post-procesamiento)."""
+    series = rsi_series(close, period)
+    if len(series) == 0 or np.isnan(series[-1]):
         return None
-    delta = np.diff(close)
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    avg_gain = gain[:period].mean()
-    avg_loss = loss[:period].mean()
-    for i in range(period, len(delta)):
-        avg_gain = (avg_gain * (period - 1) + gain[i]) / period
-        avg_loss = (avg_loss * (period - 1) + loss[i]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return float(100.0 - (100.0 / (1.0 + rs)))
+    return float(series[-1])
 
 
 def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutral_band: float = NEUTRAL_BAND) -> dict:
@@ -183,6 +313,9 @@ def main(ticker: str):
     df = fetch_ticker_history(ticker)
     if len(df) < WINDOW + HORIZON + 30:
         return {"error": f"se necesitan mas ruedas historicas para '{ticker}' (hay {len(df)})"}
+
+    macro = fetch_macro_series()
+    df = attach_macro_feature(df, macro)
 
     state = train_xgboost.local(df)
 
