@@ -1,11 +1,16 @@
 """Modelo XGBoost de tendencia, portado a Modal desde api-ml.
 
 Mismo criterio que `lstm_trend_model.py` en este mismo directorio: misma
-logica de features/target que `api-ml/src/xgb_trend.py` (retornos log de
-precio/volumen + rango %, indicadores tecnicos -- RSI/SMA/MACD/momentum -- y
-una tasa de interes exogena), entrenado on-demand con los datos del ticker
-pedido -- igual que el resto de `modelos/*.py` en este repo (arima/garch/svm),
-sin pooling entre tickers ni artefactos persistidos.
+logica de features/target base que `api-ml/src/xgb_trend.py` (retornos log
+de precio/volumen + rango %, indicadores tecnicos -- RSI/SMA/MACD/momentum
+-- y una tasa de interes exogena), entrenado on-demand con los datos del
+ticker pedido -- igual que el resto de `modelos/*.py` en este repo
+(arima/garch/svm), sin pooling entre tickers ni artefactos persistidos.
+
+A diferencia de `lstm_trend_model.py`, este archivo se queda con las 8
+features de siempre (no suma `dist_max60`/`rsi_vol_interaction`): se
+probaron ahi tambien (issue #160) y dieron peor, no mejor -- ver la nota
+junto a `FEATURE_NAMES` mas abajo.
 
 Si se cambia la logica en api-ml hay que replicarla aca a mano -- es una
 copia independiente a proposito, para que esto funcione aunque el
@@ -39,8 +44,24 @@ FEATURE_NAMES = [
     "momentum_10",
     "macro_rate_chg5",
 ]
+# WINDOW sale de una busqueda con backtest walk-forward (issue #160,
+# `scripts/tune_hyperparams.py`, resultados en `scripts/TUNING_RESULTS.md`)
+# sobre GGAL/YPFD/ALUA -- antes era un valor a ojo (30, que resulto ser el
+# mejor igual). La arquitectura actual (300 arboles, profundidad 4) tambien
+# ya andaba bien, no hizo falta tocarla. Se probaron las 2 features nuevas
+# que sí ayudaron al LSTM (`dist_max60`/`rsi_vol_interaction`, ver
+# `scripts/tune_features_and_horizon.py`) pero ACA dieron peor (52.5% contra
+# 54.7% de acierto sin ellas) -- por eso este archivo se queda con las 8
+# features de siempre, a proposito. Ojo: la busqueda uso solo 3 tickers y
+# ~570-590 predicciones -- prometedor pero no concluyente.
 WINDOW = 30
-HORIZON = 5
+# El horizonte de prediccion es un parametro de `main()`, no una constante
+# fija -- ver la nota mas larga en lstm_trend_model.py sobre por que (10
+# dias predecia mejor pero es poco util para el cliente final; se probo 1-5
+# y el acierto crece con el horizonte tambien ahi, asi que el default es 5).
+DEFAULT_HORIZON = 5
+MIN_HORIZON = 1
+MAX_HORIZON = 5
 NEUTRAL_BAND = 0.01
 # Tasa de interes exogena (ver `fetch_macro_series`): rendimiento a 10 anios
 # del Tesoro de EEUU, proxy de apetito por riesgo global que afecta flujos a
@@ -68,6 +89,46 @@ def fetch_ticker_history(ticker: str) -> pd.DataFrame:
         index=pd.to_datetime([int(r["ts"]) for r in rows], unit="ms"),
     )
     return frame.sort_index()
+
+
+# Umbral para detectar un salto de precio que casi seguro es un error de la
+# fuente, no un movimiento real de mercado (EDA issue #135: ECOG cayo ~90%
+# en un dia -- log_return -2.31 -- con mucha menos historia que el resto,
+# huele a split mal ajustado o dato roto de Yahoo). El peor dia REAL que
+# vimos en el EDA fue un dia de elecciones, log_return ~0.34 -- este umbral
+# queda comodo por encima de eso y muy por debajo del caso roto, para no
+# tocar movimientos grandes pero legitimos.
+BAD_DATA_LOG_RETURN_THRESHOLD = 1.0
+
+
+def clean_close_series(
+    close: np.ndarray, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD
+) -> tuple[np.ndarray, int]:
+    """Repara saltos de precio que son casi seguro un error de dato, en vez
+    de descartar el ticker entero: capa (winsoriza) cualquier retorno diario
+    mas grande que `threshold` en valor absoluto y reconstruye la serie de
+    precios a partir de esos retornos ya capados. Asi todos los indicadores
+    que se calculan mas abajo (SMA, RSI, MACD, etc.) quedan sobre una serie
+    sana, en vez de arrastrar el salto por 20-60 ruedas. Devuelve la serie
+    reparada y cuantos dias se tuvieron que capar (0 en el caso normal, sin
+    nada que limpiar)."""
+    log_close = np.log(close)
+    log_return = np.diff(log_close)
+    clipped = np.clip(log_return, -threshold, threshold)
+    fixed = int(np.sum(clipped != log_return))
+    log_close_clean = np.concatenate([[log_close[0]], log_close[0] + np.cumsum(clipped)])
+    return np.exp(log_close_clean), fixed
+
+
+def clean_dataframe(df: pd.DataFrame, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD) -> tuple[pd.DataFrame, int]:
+    """Aplica `clean_close_series` sobre la columna `close` de todo el
+    historico, una sola vez -- asi todo lo que consuma `df` despues (las
+    features, el entrenamiento, el ultimo precio que se le muestra al
+    cliente, el RSI de post-procesamiento) ve la misma serie ya reparada."""
+    cleaned, fixed = clean_close_series(df["close"].to_numpy(dtype=np.float64), threshold)
+    df = df.copy()
+    df["close"] = cleaned
+    return df, fixed
 
 
 def fetch_macro_series(source: str = MACRO_RATE_SOURCE, series: str = MACRO_RATE_SERIES):
@@ -166,7 +227,7 @@ def macd_histogram(close: np.ndarray, fast: int = 12, slow: int = 26, signal: in
     return macd_line - signal_line
 
 
-def build_features(df: pd.DataFrame, horizon: int = HORIZON):
+def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
     """Identico a `api-ml/src/lstm.py::build_features` (LSTM/XGBoost/Transformer
     en api-ml comparten el mismo feature engineering)."""
     close = df["close"].to_numpy(dtype=np.float64)
@@ -283,14 +344,14 @@ def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutr
 
 
 @app.function()
-def train_xgboost(df: pd.DataFrame) -> dict:
+def train_xgboost(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
     import xgboost as xgb
 
-    feats, target = build_features(df)
+    feats, target = build_features(df, horizon)
     X, y = flatten_windows(feats, target, WINDOW)
     if len(X) < 30:
         raise ValueError(
-            f"no hay suficientes ruedas para entrenar (se necesitan al menos ~{WINDOW + HORIZON + 30})"
+            f"no hay suficientes ruedas para entrenar (se necesitan al menos ~{WINDOW + horizon + 30})"
         )
 
     booster = xgb.XGBRegressor(
@@ -307,24 +368,37 @@ def train_xgboost(df: pd.DataFrame) -> dict:
     return {"booster": booster}
 
 
-@app.function(image=image, timeout=300)
+# Recursos del contenedor: 300 arboles chicos (max_depth=4) sobre ~700 filas
+# de un solo ticker. No se benchmarkeo este archivo puntual, pero se probo el
+# mismo tipo de comparacion en lstm_trend_model.py (cpu=1 vs cpu=2) y mas
+# CPU dio *peor* tiempo de respuesta para un modelo de este tamaño -- mismo
+# criterio aca, no hay motivo para esperar algo distinto con 300 arboles chicos.
+# No se fija `min_containers` (default 0, escala a cero sin trafico): se
+# prioriza no pagar por contenedores idle antes que eliminar el cold start.
+@app.function(image=image, timeout=300, cpu=1.0, memory=512)
 @modal.fastapi_endpoint()
-def main(ticker: str):
+def main(ticker: str, horizon: int = DEFAULT_HORIZON):
+    if not (MIN_HORIZON <= horizon <= MAX_HORIZON):
+        return {"error": f"horizon debe estar entre {MIN_HORIZON} y {MAX_HORIZON} dias (se pidio {horizon})"}
+
     df = fetch_ticker_history(ticker)
-    if len(df) < WINDOW + HORIZON + 30:
+    if len(df) < WINDOW + horizon + 30:
         return {"error": f"se necesitan mas ruedas historicas para '{ticker}' (hay {len(df)})"}
+    df, days_repaired = clean_dataframe(df)
 
     macro = fetch_macro_series()
     df = attach_macro_feature(df, macro)
 
-    state = train_xgboost.local(df)
+    state = train_xgboost.local(df, horizon)
 
-    feats, _ = build_features(df)
+    feats, _ = build_features(df, horizon)
     window = feats[-WINDOW:].reshape(1, -1)
     log_return = float(state["booster"].predict(window)[0])
 
-    result = derive_trend_output(df, log_return, HORIZON)
+    result = derive_trend_output(df, log_return, horizon)
     result["ticker"] = ticker.strip().upper()
     result["model"] = "xgboost"
     result["source"] = "modal (entrenado en el contenedor, solo con el ticker pedido)"
+    if days_repaired:
+        result["price_data_repaired_days"] = days_repaired
     return result

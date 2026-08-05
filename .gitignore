@@ -1,1 +1,6 @@
 __pycache__
+.venv
+scripts/tune_run.log
+scripts/tune_results.json
+scripts/tune_run_v2.log
+scripts/tune_results_v2.json

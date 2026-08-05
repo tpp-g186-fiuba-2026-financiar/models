@@ -1,12 +1,15 @@
 """Modelo LSTM de tendencia, portado a Modal desde api-ml.
 
-Mismas features y mismo target que `api-ml/src/lstm.py` (retornos log de
-precio/volumen + rango %, indicadores tecnicos -- RSI/SMA/MACD/momentum -- y
-una tasa de interes exogena, target = retorno log acumulado a `HORIZON`
-ruedas), pero entrenado on-demand con los datos del ticker pedido -- igual
-que el resto de `modelos/*.py` en este repo (arima/garch/svm): un archivo
-autocontenido que le pega a `data-colector` y entrena en el momento, sin
-pooling entre tickers ni artefactos persistidos.
+Parte de las mismas features y el mismo target que `api-ml/src/lstm.py`
+(retornos log de precio/volumen + rango %, indicadores tecnicos --
+RSI/SMA/MACD/momentum -- y una tasa de interes exogena; target = retorno
+log acumulado a `horizon` ruedas, elegible por quien pide la prediccion
+entre `MIN_HORIZON` y `MAX_HORIZON`), mas 2 features propias de este repo
+que salieron del EDA (ver `FEATURE_NAMES`). Entrenado on-demand con los
+datos del ticker pedido -- igual que el resto de `modelos/*.py` en este
+repo (arima/garch/svm): un archivo autocontenido que le pega a
+`data-colector` y entrena en el momento, sin pooling entre tickers ni
+artefactos persistidos.
 
 (api-ml en cambio entrena un unico modelo global pooleando los tickers
 disponibles -- acá se prioriza consistencia con el resto de este repo por
@@ -28,6 +31,12 @@ image = modal.Image.debian_slim().pip_install(
 app = modal.App("lstm-trend-model")
 
 DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+# Las 2 ultimas salen del EDA (issue #135, api-ml/notebooks/eda.ipynb,
+# secciones 13.b/13.c) y se validaron con backtest walk-forward (issue #160,
+# `scripts/tune_features_and_horizon.py`): sumarlas subio el acierto
+# direccional de 50.4% a 58.3% en LSTM. En XGBoost dieron peor (por eso ese
+# archivo se quedo con las 8 de siempre, ver xgboost_trend_model.py) -- no
+# son "mejores porque si", ayudan a este modelo en particular.
 FEATURE_NAMES = [
     "log_return",
     "log_volume_change",
@@ -37,9 +46,28 @@ FEATURE_NAMES = [
     "macd_norm",
     "momentum_10",
     "macro_rate_chg5",
+    "dist_max60",
+    "rsi_vol_interaction",
 ]
-WINDOW = 30
-HORIZON = 5
+# WINDOW/hidden_size/num_layers salen de una busqueda con backtest
+# walk-forward (issue #160, `scripts/tune_hyperparams.py`, resultados en
+# `scripts/TUNING_RESULTS.md`) sobre GGAL/YPFD/ALUA -- antes eran valores a
+# ojo (30, 1 capa). 2 capas le gano claro a 1 (63.3% vs 56.8% de acierto
+# direccional). Ojo: la busqueda uso solo 3 tickers y ~570 predicciones --
+# prometedor pero no concluyente, revisar si con mas tickers/mas historia
+# se sostiene.
+WINDOW = 45
+# El horizonte de prediccion es un parametro de `main()`, no una constante
+# fija -- un horizonte de 10 dias predecia mejor en el backtest, pero para
+# el cliente final es poco util ("¿en 10 dias, subio o bajo?" dice poco el
+# dia a dia). Se probo 1-5 dias (rango util) y el acierto crece con el
+# horizonte dentro de ese rango tambien (51% a 1 dia, 58% a 5) -- por eso el
+# default es 5, pero queda a eleccion de quien pida la prediccion. A cambio,
+# a 1 dia el error de magnitud es mucho mas chico (0.023 vs 0.070 a 5 dias)
+# aunque acierte la direccion casi como moneda al aire.
+DEFAULT_HORIZON = 5
+MIN_HORIZON = 1
+MAX_HORIZON = 5
 NEUTRAL_BAND = 0.01
 # Tasa de interes exogena (ver `fetch_macro_series`): rendimiento a 10 anios
 # del Tesoro de EEUU, proxy de apetito por riesgo global que afecta flujos a
@@ -67,6 +95,47 @@ def fetch_ticker_history(ticker: str) -> pd.DataFrame:
         index=pd.to_datetime([int(r["ts"]) for r in rows], unit="ms"),
     )
     return frame.sort_index()
+
+
+# Umbral para detectar un salto de precio que casi seguro es un error de la
+# fuente, no un movimiento real de mercado (EDA issue #135: ECOG cayo ~90%
+# en un dia -- log_return -2.31 -- con mucha menos historia que el resto,
+# huele a split mal ajustado o dato roto de Yahoo). El peor dia REAL que
+# vimos en el EDA fue un dia de elecciones, log_return ~0.34 -- este umbral
+# queda comodo por encima de eso y muy por debajo del caso roto, para no
+# tocar movimientos grandes pero legitimos.
+BAD_DATA_LOG_RETURN_THRESHOLD = 1.0
+
+
+def clean_close_series(
+    close: np.ndarray, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD
+) -> tuple[np.ndarray, int]:
+    """Repara saltos de precio que son casi seguro un error de dato, en vez
+    de descartar el ticker entero: capa (winsoriza) cualquier retorno diario
+    mas grande que `threshold` en valor absoluto y reconstruye la serie de
+    precios a partir de esos retornos ya capados. Asi todos los indicadores
+    que se calculan mas abajo (SMA, RSI, MACD, distancia al maximo, etc.)
+    quedan sobre una serie sana, en vez de arrastrar el salto por 20-60
+    ruedas. Devuelve la serie reparada y cuantos dias se tuvieron que capar
+    (0 en el caso normal, sin nada que limpiar)."""
+    log_close = np.log(close)
+    log_return = np.diff(log_close)
+    clipped = np.clip(log_return, -threshold, threshold)
+    fixed = int(np.sum(clipped != log_return))
+    log_close_clean = np.concatenate([[log_close[0]], log_close[0] + np.cumsum(clipped)])
+    return np.exp(log_close_clean), fixed
+
+
+def clean_dataframe(df: pd.DataFrame, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD) -> tuple[pd.DataFrame, int]:
+    """Aplica `clean_close_series` sobre la columna `close` de todo el
+    historico, una sola vez -- asi todo lo que consuma `df` despues (las
+    features, el entrenamiento, el ultimo precio que se le muestra al
+    cliente, el RSI de post-procesamiento) ve la misma serie ya reparada, en
+    vez de que cada lugar tenga que acordarse de limpiarla por su cuenta."""
+    cleaned, fixed = clean_close_series(df["close"].to_numpy(dtype=np.float64), threshold)
+    df = df.copy()
+    df["close"] = cleaned
+    return df, fixed
 
 
 def fetch_macro_series(source: str = MACRO_RATE_SOURCE, series: str = MACRO_RATE_SERIES):
@@ -165,10 +234,11 @@ def macd_histogram(close: np.ndarray, fast: int = 12, slow: int = 26, signal: in
     return macd_line - signal_line
 
 
-def build_features(df: pd.DataFrame, horizon: int = HORIZON):
-    """Identico a `api-ml/src/lstm.py::build_features`: retornos log de
-    precio/volumen + rango %, indicadores tecnicos (RSI/SMA/MACD/momentum) y
-    tasa macro exogena. Target = retorno log acumulado a `horizon` ruedas.
+def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
+    """Retornos log de precio/volumen + rango %, indicadores tecnicos
+    (RSI/SMA/MACD/momentum), tasa macro exogena, y 2 features del EDA
+    (issue #135): distancia al maximo de 60 ruedas y la interaccion
+    RSI x volumen. Target = retorno log acumulado a `horizon` ruedas.
     """
     close = df["close"].to_numpy(dtype=np.float64)
     volume = df["volume"].to_numpy(dtype=np.float64)
@@ -194,6 +264,23 @@ def build_features(df: pd.DataFrame, horizon: int = HORIZON):
     macro_chg5 = np.full(len(close), np.nan)
     macro_chg5[5:] = macro_rate[5:] - macro_rate[:-5]
 
+    # dist_max60: que tan lejos esta el precio de hoy del maximo de los
+    # ultimos 60 dias (0 = esta en el maximo, negativo = por debajo). En el
+    # EDA fue la feature con mas señal de las 10 -- capta rebotes despues de
+    # una caida fuerte, algo que RSI/SMA20 no ven porque miran ventanas mas
+    # cortas (14 y 20 dias).
+    roll_max60 = df["close"].rolling(60, min_periods=30).max().to_numpy(dtype=np.float64)
+    dist_max60 = close / np.where(roll_max60 == 0, np.nan, roll_max60) - 1.0
+
+    # rsi_vol_interaction: RSI normalizado x volumen "raro" (z-score contra
+    # el promedio propio de 60 dias). En el EDA, "volumen alto + RSI en zona
+    # media" predecia mas que cualquiera de las dos por separado.
+    vol_series = df["volume"].astype(float)
+    roll_mean_vol = vol_series.rolling(60, min_periods=20).mean()
+    roll_std_vol = vol_series.rolling(60, min_periods=20).std()
+    vol_z = ((vol_series - roll_mean_vol) / roll_std_vol.replace(0, np.nan)).to_numpy(dtype=np.float64)
+    rsi_vol_interaction = rsi_norm * np.nan_to_num(vol_z, nan=0.0, posinf=0.0, neginf=0.0)
+
     feats = np.column_stack(
         [
             log_return,
@@ -204,6 +291,8 @@ def build_features(df: pd.DataFrame, horizon: int = HORIZON):
             macd_norm[1:],
             momentum_10[1:],
             macro_chg5[1:],
+            dist_max60[1:],
+            rsi_vol_interaction[1:],
         ]
     )
 
@@ -277,15 +366,15 @@ def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutr
 
 
 @app.function()
-def train_lstm(df: pd.DataFrame) -> dict:
+def train_lstm(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
     import torch
     from torch import nn
 
-    feats, target = build_features(df)
+    feats, target = build_features(df, horizon)
     X, y = make_windows(feats, target, WINDOW)
     if len(X) < 30:
         raise ValueError(
-            f"no hay suficientes ruedas para entrenar (se necesitan al menos ~{WINDOW + HORIZON + 30})"
+            f"no hay suficientes ruedas para entrenar (se necesitan al menos ~{WINDOW + horizon + 30})"
         )
 
     flat = X.reshape(-1, X.shape[-1])
@@ -315,7 +404,7 @@ def train_lstm(df: pd.DataFrame) -> dict:
             return self.head(out[:, -1, :]).squeeze(-1)
 
     torch.manual_seed(42)
-    net = _LSTMRegressor(len(FEATURE_NAMES))
+    net = _LSTMRegressor(len(FEATURE_NAMES), hidden_size=32, num_layers=2)
     optimizer = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     loss_fn = nn.MSELoss()
 
@@ -343,21 +432,32 @@ def train_lstm(df: pd.DataFrame) -> dict:
     }
 
 
-@app.function(image=image, timeout=300)
+# Recursos del contenedor: benchmarkeado a mano (curl con tiempos, request
+# en caliente) contra cpu=2.0/memory=1024 -- contra la intuicion, quedo mas
+# LENTO (~11s en caliente) que con cpu=1.0/memory=512 (~7.6s). La red es tan
+# chica (32 neuronas) que no se beneficia de mas nucleos, y de paso sale mas
+# barato. No se fija `min_containers` (default 0, escala a cero sin
+# trafico): se prioriza no pagar por contenedores idle antes que eliminar
+# el cold start (~33s la primera vez, aceptable para este caso de uso).
+@app.function(image=image, timeout=300, cpu=1.0, memory=512)
 @modal.fastapi_endpoint()
-def main(ticker: str):
+def main(ticker: str, horizon: int = DEFAULT_HORIZON):
     import torch
 
+    if not (MIN_HORIZON <= horizon <= MAX_HORIZON):
+        return {"error": f"horizon debe estar entre {MIN_HORIZON} y {MAX_HORIZON} dias (se pidio {horizon})"}
+
     df = fetch_ticker_history(ticker)
-    if len(df) < WINDOW + HORIZON + 30:
+    if len(df) < WINDOW + horizon + 30:
         return {"error": f"se necesitan mas ruedas historicas para '{ticker}' (hay {len(df)})"}
+    df, days_repaired = clean_dataframe(df)
 
     macro = fetch_macro_series()
     df = attach_macro_feature(df, macro)
 
-    state = train_lstm.local(df)
+    state = train_lstm.local(df, horizon)
 
-    feats, _ = build_features(df)
+    feats, _ = build_features(df, horizon)
     window = feats[-WINDOW:][None, :, :]
     scaled = (window - state["feature_mean"]) / state["feature_std"]
     x = torch.tensor(scaled, dtype=torch.float32)
@@ -368,8 +468,10 @@ def main(ticker: str):
         pred_scaled = float(net(x).item())
     log_return = pred_scaled * state["target_std"] + state["target_mean"]
 
-    result = derive_trend_output(df, log_return, HORIZON)
+    result = derive_trend_output(df, log_return, horizon)
     result["ticker"] = ticker.strip().upper()
     result["model"] = "lstm"
     result["source"] = "modal (entrenado en el contenedor, solo con el ticker pedido)"
+    if days_repaired:
+        result["price_data_repaired_days"] = days_repaired
     return result

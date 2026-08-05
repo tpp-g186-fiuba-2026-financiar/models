@@ -1,0 +1,10 @@
+# Dependencias para correr modelos/*.py y las herramientas de scripts/
+# localmente, sin pasar por Modal. No es lo que corre en produccion (eso lo
+# define el modal.Image de cada archivo) -- esto es solo para poder iterar
+# rapido en la compu de cualquiera del equipo.
+numpy==2.1.3
+pandas==2.2.3
+requests==2.32.3
+torch==2.5.1
+xgboost==2.1.3
+scikit-learn==1.5.2
