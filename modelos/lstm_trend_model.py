@@ -6,10 +6,8 @@ RSI/SMA/MACD/momentum -- y una tasa de interes exogena; target = retorno
 log acumulado a `horizon` ruedas, elegible por quien pide la prediccion
 entre `MIN_HORIZON` y `MAX_HORIZON`), mas 2 features propias de este repo
 que salieron del EDA (ver `FEATURE_NAMES`). Entrenado on-demand con los
-datos del ticker pedido -- igual que el resto de `modelos/*.py` en este
-repo (arima/garch/svm): un archivo autocontenido que le pega a
-`data-colector` y entrena en el momento, sin pooling entre tickers ni
-artefactos persistidos.
+datos de cada ticker configurado. Un cron diario en dias habiles hace backtest, promocion
+y persistencia en un Modal Volume; el endpoint solo ejecuta inferencia.
 
 (api-ml en cambio entrena un unico modelo global pooleando los tickers
 disponibles -- acá se prioriza consistencia con el resto de este repo por
@@ -20,6 +18,12 @@ cambio aca a mano -- son dos copias independientes a proposito, para que
 esto funcione aunque el servicio de api-ml en Render este caido.
 """
 
+import json
+import os
+import pickle
+from datetime import datetime, timezone
+from pathlib import Path
+
 import modal
 import numpy as np
 import pandas as pd
@@ -29,8 +33,21 @@ image = modal.Image.debian_slim().pip_install(
     "fastapi[standard]", "torch", "numpy", "pandas", "requests"
 )
 app = modal.App("lstm-trend-model")
+artifact_volume = modal.Volume.from_name("trend-model-artifacts", create_if_missing=True)
+ARTIFACT_ROOT = Path("/artifacts/lstm")
+BACKTEST_DAYS = 60
 
 DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+
+
+def fetch_available_tickers() -> list[str]:
+    response = requests.post(f"{DATA_COLLECTOR_URL}/available-tickers", timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    tickers = payload.get("tickers") or (payload.get("message") or {}).get("tickers") or []
+    if not tickers:
+        raise ValueError("data-colector no devolvio tickers disponibles")
+    return sorted({str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()})
 # Las 2 ultimas salen del EDA (issue #135, api-ml/notebooks/eda.ipynb,
 # secciones 13.b/13.c) y se validaron con backtest walk-forward (issue #160,
 # `scripts/tune_features_and_horizon.py`): sumarlas subio el acierto
@@ -365,6 +382,26 @@ def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutr
     }
 
 
+def build_lstm_network():
+    import torch
+    from torch import nn
+
+    class _LSTMRegressor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lstm = nn.LSTM(
+                input_size=len(FEATURE_NAMES), hidden_size=32, num_layers=2,
+                batch_first=True, dropout=0.1,
+            )
+            self.head = nn.Linear(32, 1)
+
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            return self.head(out[:, -1, :]).squeeze(-1)
+
+    return _LSTMRegressor()
+
+
 @app.function()
 def train_lstm(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
     import torch
@@ -387,24 +424,8 @@ def train_lstm(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
     X_t = torch.tensor(X_scaled, dtype=torch.float32)
     y_t = torch.tensor((y - target_mean) / target_std, dtype=torch.float32)
 
-    class _LSTMRegressor(nn.Module):
-        def __init__(self, input_size: int, hidden_size: int = 32, num_layers: int = 1, dropout: float = 0.1):
-            super().__init__()
-            self.lstm = nn.LSTM(
-                input_size=input_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0.0,
-            )
-            self.head = nn.Linear(hidden_size, 1)
-
-        def forward(self, x):
-            out, _ = self.lstm(x)
-            return self.head(out[:, -1, :]).squeeze(-1)
-
     torch.manual_seed(42)
-    net = _LSTMRegressor(len(FEATURE_NAMES), hidden_size=32, num_layers=2)
+    net = build_lstm_network()
     optimizer = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     loss_fn = nn.MSELoss()
 
@@ -424,12 +445,96 @@ def train_lstm(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
 
     net.eval()
     return {
-        "net": net,
+        "net_state": net.state_dict(),
         "feature_mean": feature_mean,
         "feature_std": feature_std,
         "target_mean": target_mean,
         "target_std": target_std,
     }
+
+
+def predict_lstm_state(state: dict, window: np.ndarray) -> float:
+    import torch
+
+    scaled = (window - state["feature_mean"]) / state["feature_std"]
+    net = build_lstm_network()
+    net.load_state_dict(state["net_state"])
+    net.eval()
+    with torch.no_grad():
+        pred_scaled = float(net(torch.tensor(scaled, dtype=torch.float32)).item())
+    return pred_scaled * state["target_std"] + state["target_mean"]
+
+
+def backtest_lstm(df: pd.DataFrame, horizon: int) -> dict:
+    split = len(df) - BACKTEST_DAYS - horizon
+    if split < WINDOW + horizon + 30:
+        raise ValueError("no hay suficiente historia para el backtest temporal")
+    state = train_lstm.local(df.iloc[:split], horizon)
+    feats, target = build_features(df, horizon)
+    predicted, actual = [], []
+    for feature_day in range(max(WINDOW, split - 1), len(feats)):
+        if np.isnan(target[feature_day]):
+            continue
+        window = feats[feature_day - WINDOW + 1 : feature_day + 1][None, :, :]
+        predicted.append(predict_lstm_state(state, window))
+        actual.append(float(target[feature_day]))
+    if not actual:
+        raise ValueError("el backtest no produjo observaciones")
+    predicted_arr, actual_arr = np.asarray(predicted), np.asarray(actual)
+    return {
+        "directional_accuracy": float(np.mean(np.sign(predicted_arr) == np.sign(actual_arr))),
+        "mae": float(np.mean(np.abs(predicted_arr - actual_arr))),
+        "observations": len(actual),
+    }
+
+
+def _artifact_path(ticker: str, horizon: int) -> Path:
+    return ARTIFACT_ROOT / ticker / f"h{horizon}" / "production.pkl"
+
+
+def retrain_one(ticker: str, horizon: int) -> dict:
+    ticker = ticker.strip().upper()
+    df, repaired = clean_dataframe(fetch_ticker_history(ticker))
+    df = attach_macro_feature(df, fetch_macro_series())
+    metrics = backtest_lstm(df, horizon)
+    path = _artifact_path(ticker, horizon)
+    incumbent_score = -1.0
+    if path.exists():
+        with path.open("rb") as fh:
+            incumbent_score = float(pickle.load(fh)["metrics"]["directional_accuracy"])
+    promoted = metrics["directional_accuracy"] > incumbent_score
+    if promoted:
+        artifact = {
+            "state": train_lstm.local(df, horizon), "metrics": metrics,
+            "ticker": ticker, "horizon": horizon,
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "training_data_as_of": df.index[-1].strftime("%Y-%m-%d"),
+            "price_data_repaired_days": repaired,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("wb") as fh:
+            pickle.dump(artifact, fh)
+        os.replace(temporary, path)
+        artifact_volume.commit()
+    return {"ticker": ticker, "horizon": horizon, "promoted": promoted, "metrics": metrics}
+
+
+@app.function(
+    image=image, volumes={"/artifacts": artifact_volume},
+    schedule=modal.Cron("0 20 * * 1-5", timezone="America/Argentina/Buenos_Aires"),
+    timeout=86400, cpu=1.0, memory=1024,
+)
+def retrain_models() -> list[dict]:
+    results = []
+    for ticker in fetch_available_tickers():
+        for horizon in range(MIN_HORIZON, MAX_HORIZON + 1):
+            try:
+                results.append(retrain_one(ticker, horizon))
+            except Exception as exc:
+                results.append({"ticker": ticker, "horizon": horizon, "error": str(exc)})
+    print(json.dumps(results))
+    return results
 
 
 # Recursos del contenedor: benchmarkeado a mano (curl con tiempos, request
@@ -439,13 +544,22 @@ def train_lstm(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
 # barato. No se fija `min_containers` (default 0, escala a cero sin
 # trafico): se prioriza no pagar por contenedores idle antes que eliminar
 # el cold start (~33s la primera vez, aceptable para este caso de uso).
-@app.function(image=image, timeout=300, cpu=1.0, memory=512)
+@app.function(
+    image=image, timeout=60, cpu=1.0, memory=512,
+    volumes={"/artifacts": artifact_volume},
+)
 @modal.fastapi_endpoint()
 def main(ticker: str, horizon: int = DEFAULT_HORIZON):
-    import torch
-
     if not (MIN_HORIZON <= horizon <= MAX_HORIZON):
         return {"error": f"horizon debe estar entre {MIN_HORIZON} y {MAX_HORIZON} dias (se pidio {horizon})"}
+
+    ticker = ticker.strip().upper()
+    artifact_volume.reload()
+    path = _artifact_path(ticker, horizon)
+    if not path.exists():
+        return {"error": f"todavia no hay un modelo entrenado para '{ticker}' con horizonte {horizon}"}
+    with path.open("rb") as fh:
+        artifact = pickle.load(fh)
 
     df = fetch_ticker_history(ticker)
     if len(df) < WINDOW + horizon + 30:
@@ -455,23 +569,16 @@ def main(ticker: str, horizon: int = DEFAULT_HORIZON):
     macro = fetch_macro_series()
     df = attach_macro_feature(df, macro)
 
-    state = train_lstm.local(df, horizon)
-
     feats, _ = build_features(df, horizon)
     window = feats[-WINDOW:][None, :, :]
-    scaled = (window - state["feature_mean"]) / state["feature_std"]
-    x = torch.tensor(scaled, dtype=torch.float32)
-
-    net = state["net"]
-    net.eval()
-    with torch.no_grad():
-        pred_scaled = float(net(x).item())
-    log_return = pred_scaled * state["target_std"] + state["target_mean"]
+    log_return = predict_lstm_state(artifact["state"], window)
 
     result = derive_trend_output(df, log_return, horizon)
-    result["ticker"] = ticker.strip().upper()
+    result["ticker"] = ticker
     result["model"] = "lstm"
-    result["source"] = "modal (entrenado en el contenedor, solo con el ticker pedido)"
+    result["source"] = "modal (artefacto preentrenado)"
+    result["model_version"] = artifact["trained_at"]
+    result["backtest"] = artifact["metrics"]
     if days_repaired:
         result["price_data_repaired_days"] = days_repaired
     return result

@@ -3,9 +3,8 @@
 Mismo criterio que `lstm_trend_model.py` en este mismo directorio: misma
 logica de features/target base que `api-ml/src/xgb_trend.py` (retornos log
 de precio/volumen + rango %, indicadores tecnicos -- RSI/SMA/MACD/momentum
--- y una tasa de interes exogena), entrenado on-demand con los datos del
-ticker pedido -- igual que el resto de `modelos/*.py` en este repo
-(arima/garch/svm), sin pooling entre tickers ni artefactos persistidos.
+-- y una tasa de interes exogena). Un cron diario en dias habiles hace backtest, promocion
+y persistencia en un Modal Volume; el endpoint solo ejecuta inferencia.
 
 A diferencia de `lstm_trend_model.py`, este archivo se queda con las 8
 features de siempre (no suma `dist_max60`/`rsi_vol_interaction`): se
@@ -16,6 +15,12 @@ Si se cambia la logica en api-ml hay que replicarla aca a mano -- es una
 copia independiente a proposito, para que esto funcione aunque el
 servicio de api-ml en Render este caido.
 """
+
+import json
+import os
+import pickle
+from datetime import datetime, timezone
+from pathlib import Path
 
 import modal
 import numpy as np
@@ -32,8 +37,21 @@ image = (
     .pip_install("fastapi[standard]", "xgboost", "scikit-learn", "numpy", "pandas", "requests")
 )
 app = modal.App("xgboost-trend-model")
+artifact_volume = modal.Volume.from_name("trend-model-artifacts", create_if_missing=True)
+ARTIFACT_ROOT = Path("/artifacts/xgboost")
+BACKTEST_DAYS = 60
 
 DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+
+
+def fetch_available_tickers() -> list[str]:
+    response = requests.post(f"{DATA_COLLECTOR_URL}/available-tickers", timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    tickers = payload.get("tickers") or (payload.get("message") or {}).get("tickers") or []
+    if not tickers:
+        raise ValueError("data-colector no devolvio tickers disponibles")
+    return sorted({str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()})
 FEATURE_NAMES = [
     "log_return",
     "log_volume_change",
@@ -368,6 +386,86 @@ def train_xgboost(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
     return {"booster": booster}
 
 
+def backtest_xgboost(df: pd.DataFrame, horizon: int) -> dict:
+    """Holdout temporal: el candidato nunca ve las ultimas ruedas evaluadas."""
+    split = len(df) - BACKTEST_DAYS - horizon
+    if split < WINDOW + horizon + 30:
+        raise ValueError("no hay suficiente historia para el backtest temporal")
+    state = train_xgboost.local(df.iloc[:split], horizon)
+    feats, target = build_features(df, horizon)
+    start = max(WINDOW, split - 1)
+    predicted, actual = [], []
+    for feature_day in range(start, len(feats)):
+        if np.isnan(target[feature_day]):
+            continue
+        window = feats[feature_day - WINDOW + 1 : feature_day + 1].reshape(1, -1)
+        predicted.append(float(state["booster"].predict(window)[0]))
+        actual.append(float(target[feature_day]))
+    if not actual:
+        raise ValueError("el backtest no produjo observaciones")
+    predicted_arr, actual_arr = np.asarray(predicted), np.asarray(actual)
+    return {
+        "directional_accuracy": float(np.mean(np.sign(predicted_arr) == np.sign(actual_arr))),
+        "mae": float(np.mean(np.abs(predicted_arr - actual_arr))),
+        "observations": len(actual),
+    }
+
+
+def _artifact_path(ticker: str, horizon: int) -> Path:
+    return ARTIFACT_ROOT / ticker / f"h{horizon}" / "production.pkl"
+
+
+def retrain_one(ticker: str, horizon: int) -> dict:
+    ticker = ticker.strip().upper()
+    df, repaired = clean_dataframe(fetch_ticker_history(ticker))
+    df = attach_macro_feature(df, fetch_macro_series())
+    metrics = backtest_xgboost(df, horizon)
+    path = _artifact_path(ticker, horizon)
+    incumbent_score = -1.0
+    if path.exists():
+        with path.open("rb") as fh:
+            incumbent_score = float(pickle.load(fh)["metrics"]["directional_accuracy"])
+    promoted = metrics["directional_accuracy"] > incumbent_score
+    if promoted:
+        artifact = {
+            "state": train_xgboost.local(df, horizon),
+            "metrics": metrics,
+            "ticker": ticker,
+            "horizon": horizon,
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "training_data_as_of": df.index[-1].strftime("%Y-%m-%d"),
+            "price_data_repaired_days": repaired,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("wb") as fh:
+            pickle.dump(artifact, fh)
+        os.replace(temporary, path)
+        artifact_volume.commit()
+    return {"ticker": ticker, "horizon": horizon, "promoted": promoted, "metrics": metrics}
+
+
+@app.function(
+    image=image,
+    volumes={"/artifacts": artifact_volume},
+    schedule=modal.Cron("0 21 * * 1-5", timezone="America/Argentina/Buenos_Aires"),
+    timeout=86400,
+    cpu=1.0,
+    memory=1024,
+)
+def retrain_models() -> list[dict]:
+    """Reentrena cada dia habil. Tambien se puede ejecutar a mano desde Modal."""
+    results = []
+    for ticker in fetch_available_tickers():
+        for horizon in range(MIN_HORIZON, MAX_HORIZON + 1):
+            try:
+                results.append(retrain_one(ticker, horizon))
+            except Exception as exc:  # un ticker no cancela el resto del lote
+                results.append({"ticker": ticker, "horizon": horizon, "error": str(exc)})
+    print(json.dumps(results))
+    return results
+
+
 # Recursos del contenedor: 300 arboles chicos (max_depth=4) sobre ~700 filas
 # de un solo ticker. No se benchmarkeo este archivo puntual, pero se probo el
 # mismo tipo de comparacion en lstm_trend_model.py (cpu=1 vs cpu=2) y mas
@@ -375,11 +473,25 @@ def train_xgboost(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
 # criterio aca, no hay motivo para esperar algo distinto con 300 arboles chicos.
 # No se fija `min_containers` (default 0, escala a cero sin trafico): se
 # prioriza no pagar por contenedores idle antes que eliminar el cold start.
-@app.function(image=image, timeout=300, cpu=1.0, memory=512)
+@app.function(
+    image=image,
+    timeout=60,
+    cpu=1.0,
+    memory=512,
+    volumes={"/artifacts": artifact_volume},
+)
 @modal.fastapi_endpoint()
 def main(ticker: str, horizon: int = DEFAULT_HORIZON):
     if not (MIN_HORIZON <= horizon <= MAX_HORIZON):
         return {"error": f"horizon debe estar entre {MIN_HORIZON} y {MAX_HORIZON} dias (se pidio {horizon})"}
+
+    ticker = ticker.strip().upper()
+    artifact_volume.reload()
+    path = _artifact_path(ticker, horizon)
+    if not path.exists():
+        return {"error": f"todavia no hay un modelo entrenado para '{ticker}' con horizonte {horizon}"}
+    with path.open("rb") as fh:
+        artifact = pickle.load(fh)
 
     df = fetch_ticker_history(ticker)
     if len(df) < WINDOW + horizon + 30:
@@ -389,16 +501,16 @@ def main(ticker: str, horizon: int = DEFAULT_HORIZON):
     macro = fetch_macro_series()
     df = attach_macro_feature(df, macro)
 
-    state = train_xgboost.local(df, horizon)
-
     feats, _ = build_features(df, horizon)
     window = feats[-WINDOW:].reshape(1, -1)
-    log_return = float(state["booster"].predict(window)[0])
+    log_return = float(artifact["state"]["booster"].predict(window)[0])
 
     result = derive_trend_output(df, log_return, horizon)
-    result["ticker"] = ticker.strip().upper()
+    result["ticker"] = ticker
     result["model"] = "xgboost"
-    result["source"] = "modal (entrenado en el contenedor, solo con el ticker pedido)"
+    result["source"] = "modal (artefacto preentrenado)"
+    result["model_version"] = artifact["trained_at"]
+    result["backtest"] = artifact["metrics"]
     if days_repaired:
         result["price_data_repaired_days"] = days_repaired
     return result
