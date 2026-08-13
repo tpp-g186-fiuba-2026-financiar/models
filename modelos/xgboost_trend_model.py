@@ -394,13 +394,22 @@ def backtest_xgboost(df: pd.DataFrame, horizon: int) -> dict:
     state = train_xgboost.local(df.iloc[:split], horizon)
     feats, target = build_features(df, horizon)
     start = max(WINDOW, split - 1)
-    predicted, actual = [], []
+    predicted, actual, evaluation_series = [], [], []
     for feature_day in range(start, len(feats)):
         if np.isnan(target[feature_day]):
             continue
         window = feats[feature_day - WINDOW + 1 : feature_day + 1].reshape(1, -1)
-        predicted.append(float(state["booster"].predict(window)[0]))
-        actual.append(float(target[feature_day]))
+        predicted_return = float(state["booster"].predict(window)[0])
+        actual_return = float(target[feature_day])
+        predicted.append(predicted_return)
+        actual.append(actual_return)
+        base_day = feature_day + 1
+        future_day = base_day + horizon
+        evaluation_series.append({
+            "date": df.index[future_day].strftime("%Y-%m-%d"),
+            "predicted": float(df["close"].iloc[base_day] * np.exp(predicted_return)),
+            "actual": float(df["close"].iloc[future_day]),
+        })
     if not actual:
         raise ValueError("el backtest no produjo observaciones")
     predicted_arr, actual_arr = np.asarray(predicted), np.asarray(actual)
@@ -408,6 +417,7 @@ def backtest_xgboost(df: pd.DataFrame, horizon: int) -> dict:
         "directional_accuracy": float(np.mean(np.sign(predicted_arr) == np.sign(actual_arr))),
         "mae": float(np.mean(np.abs(predicted_arr - actual_arr))),
         "observations": len(actual),
+        "series": evaluation_series[-30:],
     }
 
 
@@ -422,10 +432,13 @@ def retrain_one(ticker: str, horizon: int) -> dict:
     metrics = backtest_xgboost(df, horizon)
     path = _artifact_path(ticker, horizon)
     incumbent_score = -1.0
+    incumbent_has_series = False
     if path.exists():
         with path.open("rb") as fh:
-            incumbent_score = float(pickle.load(fh)["metrics"]["directional_accuracy"])
-    promoted = metrics["directional_accuracy"] > incumbent_score
+            incumbent = pickle.load(fh)
+            incumbent_score = float(incumbent["metrics"]["directional_accuracy"])
+            incumbent_has_series = bool(incumbent["metrics"].get("series"))
+    promoted = metrics["directional_accuracy"] > incumbent_score or not incumbent_has_series
     if promoted:
         artifact = {
             "state": train_xgboost.local(df, horizon),

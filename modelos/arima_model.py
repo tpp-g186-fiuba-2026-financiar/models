@@ -52,13 +52,24 @@ def retrain_one(ticker: str) -> dict:
     split = len(values) - BACKTEST_DAYS
     candidate_test = train_model.local(values[:split], MEDIA_MOVIL)
     forecast = np.asarray(candidate_test.forecast(steps=BACKTEST_DAYS), dtype=float)
-    metrics = {"mae": float(np.mean(np.abs(forecast - np.asarray(values[split:])))), "observations": BACKTEST_DAYS}
+    actual = np.asarray(values[split:])
+    metrics = {
+        "mae": float(np.mean(np.abs(forecast - actual))),
+        "observations": BACKTEST_DAYS,
+        "series": [
+            {"date": str(index + 1), "predicted": float(predicted), "actual": float(real)}
+            for index, (predicted, real) in enumerate(zip(forecast, actual))
+        ],
+    }
     path = ARTIFACT_ROOT / ticker / "production.pkl"
     incumbent_mae = float("inf")
+    incumbent_has_series = False
     if path.exists():
         with path.open("rb") as fh:
-            incumbent_mae = float(pickle.load(fh)["metrics"]["mae"])
-    promoted = metrics["mae"] < incumbent_mae
+            incumbent = pickle.load(fh)
+            incumbent_mae = float(incumbent["metrics"]["mae"])
+            incumbent_has_series = bool(incumbent["metrics"].get("series"))
+    promoted = metrics["mae"] < incumbent_mae or not incumbent_has_series
     if promoted:
         artifact = {
             "state": train_model.local(values, MEDIA_MOVIL), "metrics": metrics,
