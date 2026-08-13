@@ -85,3 +85,13 @@ https://financiar186--xgboost-trend-model-main-dev.modal.run/?ticker=GGAL
 El endpoint solo hace feature engineering e inferencia. Nunca entrena. Si
 todavia no existe un artefacto para el ticker/horizonte pedido responde un
 error inmediato en vez de bloquear la API durante minutos.
+
+## Seguimiento operativo
+
+Las instrucciones para controlar semanalmente los jobs, interpretar sus
+resultados, probar produccion y responder ante fallas estan en
+[`SEGUIMIENTO_SEMANAL.md`](SEGUIMIENTO_SEMANAL.md).
+
+La explicacion de los tests, el backtest walk-forward y el paper trading de
+`api-ml`, junto con el proceso para seguir la calidad predictiva semana a
+semana, esta en [`SEGUIMIENTO_CALIDAD.md`](SEGUIMIENTO_CALIDAD.md).
