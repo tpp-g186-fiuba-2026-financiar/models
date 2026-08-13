@@ -537,6 +537,30 @@ def retrain_models() -> list[dict]:
     return results
 
 
+@app.function(
+    image=image, volumes={"/artifacts": artifact_volume}, timeout=7200,
+    cpu=1.0, memory=1024,
+)
+@modal.fastapi_endpoint()
+def prepare(ticker: str) -> dict:
+    """Bootstrap bajo demanda: crea solamente los horizontes que faltan."""
+    ticker = ticker.strip().upper()
+    artifact_volume.reload()
+    missing = [
+        horizon for horizon in range(MIN_HORIZON, MAX_HORIZON + 1)
+        if not _artifact_path(ticker, horizon).exists()
+    ]
+    if not missing:
+        return {"ticker": ticker, "status": "ready", "trained_horizons": []}
+    results = []
+    for horizon in missing:
+        try:
+            results.append(retrain_one(ticker, horizon))
+        except Exception as exc:
+            results.append({"ticker": ticker, "horizon": horizon, "error": str(exc)})
+    return {"ticker": ticker, "status": "completed", "results": results}
+
+
 # Recursos del contenedor: benchmarkeado a mano (curl con tiempos, request
 # en caliente) contra cpu=2.0/memory=1024 -- contra la intuicion, quedo mas
 # LENTO (~11s en caliente) que con cpu=1.0/memory=512 (~7.6s). La red es tan
