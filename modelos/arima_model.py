@@ -31,13 +31,45 @@ def fetch_available_tickers() -> list[str]:
     return sorted({str(t).strip().upper() for t in tickers if str(t).strip()})
 
 
-def get_ticker_data(ticker: str) -> list[float]:
+def get_ticker_rows(ticker: str) -> list[dict]:
     response = requests.post(f"{DATA_COLLECTOR_URL}/historical-data/{ticker}", timeout=30)
     response.raise_for_status()
     rows = response.json().get("data") or []
     if not rows:
         raise ValueError(f"no hay historia para {ticker}")
-    return [float(row["close_amount"]) for row in rows]
+    return rows
+
+
+def get_ticker_data(ticker: str) -> list[float]:
+    return [float(row["close_amount"]) for row in get_ticker_rows(ticker)]
+
+
+def rsi_last(close: list[float], period: int = 14) -> float | None:
+    """RSI de Wilder sobre el ultimo valor de la serie (mismo calculo que lstm_trend_model.py::rsi)."""
+    if len(close) < period + 1:
+        return None
+    deltas = np.diff(np.asarray(close, dtype=np.float64))
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = gains[:period].mean()
+    avg_loss = losses[:period].mean()
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def rsi_condition(rsi_value: float | None) -> str:
+    if rsi_value is None:
+        return "indeterminado"
+    if rsi_value >= 70:
+        return "sobrecompra"
+    if rsi_value <= 30:
+        return "sobreventa"
+    return "neutral"
 
 
 @app.function()
@@ -52,13 +84,33 @@ def retrain_one(ticker: str) -> dict:
     split = len(values) - BACKTEST_DAYS
     candidate_test = train_model.local(values[:split], MEDIA_MOVIL)
     forecast = np.asarray(candidate_test.forecast(steps=BACKTEST_DAYS), dtype=float)
-    metrics = {"mae": float(np.mean(np.abs(forecast - np.asarray(values[split:])))), "observations": BACKTEST_DAYS}
+    actual = np.asarray(values[split:])
+    # Direccion de cada punto del forecast vs. el ultimo cierre conocido antes del
+    # test window (mismo origen que "signal" en los demas modelos: predicted vs
+    # last_close), no dia a dia -- el forecast de ARIMA es multi-step desde un
+    # unico origen, no rolling.
+    baseline = values[split - 1]
+    directional_accuracy = float(
+        np.mean(np.sign(forecast - baseline) == np.sign(actual - baseline))
+    )
+    metrics = {
+        "mae": float(np.mean(np.abs(forecast - actual))),
+        "observations": BACKTEST_DAYS,
+        "directional_accuracy": directional_accuracy,
+        "series": [
+            {"date": str(index + 1), "predicted": float(predicted), "actual": float(real)}
+            for index, (predicted, real) in enumerate(zip(forecast, actual))
+        ],
+    }
     path = ARTIFACT_ROOT / ticker / "production.pkl"
     incumbent_mae = float("inf")
+    incumbent_has_series = False
     if path.exists():
         with path.open("rb") as fh:
-            incumbent_mae = float(pickle.load(fh)["metrics"]["mae"])
-    promoted = metrics["mae"] < incumbent_mae
+            incumbent = pickle.load(fh)
+            incumbent_mae = float(incumbent["metrics"]["mae"])
+            incumbent_has_series = bool(incumbent["metrics"].get("series"))
+    promoted = metrics["mae"] < incumbent_mae or not incumbent_has_series
     if promoted:
         artifact = {
             "state": train_model.local(values, MEDIA_MOVIL), "metrics": metrics,
@@ -104,9 +156,20 @@ def main(ticker: str, predictions: int, media_movil: int = MEDIA_MOVIL):
         return {"error": f"todavia no hay un modelo entrenado para '{ticker}'"}
     with path.open("rb") as fh:
         artifact = pickle.load(fh)
-    values = get_ticker_data(ticker)
+    rows = get_ticker_rows(ticker)
+    values = [float(row["close_amount"]) for row in rows]
+    last_ts = rows[-1].get("ts")
+    as_of = (
+        datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        if last_ts is not None
+        else None
+    )
+    rsi_value = rsi_last(values)
     return {
         "prediction": artifact["state"].forecast(steps=predictions).tolist(),
         "valor_actual": values[-1], "cant_predicciones": predictions,
         "model_version": artifact["trained_at"], "backtest": artifact["metrics"],
+        "rsi": round(rsi_value, 2) if rsi_value is not None else None,
+        "condition": rsi_condition(rsi_value),
+        "as_of": as_of,
     }
