@@ -1,4 +1,4 @@
-"""Smoke tests de los 5 endpoints productivos.
+"""Smoke tests de los endpoints productivos.
 
 Llaman a la funcion real del endpoint (`main.local(...)`, que corre el
 mismo codigo que Modal ejecuta en produccion, sin pasar por la red de
@@ -15,6 +15,7 @@ import arima_model
 import garch_model
 import lstm_trend_model
 import svm_model
+import transformer_trend_model
 import xgboost_trend_model
 
 
@@ -51,4 +52,10 @@ def test_arima_endpoint_responds():
 def test_garch_endpoint_responds():
     with patch.object(garch_model.artifact_volume, "reload", return_value=None):
         result = garch_model.main.local(ticker="GGAL")
+    _assert_responds_gracefully(result)
+
+
+def test_transformer_endpoint_responds():
+    with patch.object(transformer_trend_model.artifact_volume, "reload", return_value=None):
+        result = transformer_trend_model.main.local(ticker="GGAL")
     _assert_responds_gracefully(result)

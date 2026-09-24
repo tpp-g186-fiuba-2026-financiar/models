@@ -33,6 +33,12 @@ def test_xgboost_endpoint_never_trains():
     assert "retrain_one" not in calls
 
 
+def test_transformer_endpoint_never_trains():
+    calls = _function_calls(ROOT / "transformer_trend_model.py", "main")
+    assert "train_transformer" not in calls
+    assert "retrain_one" not in calls
+
+
 def test_classic_model_endpoints_never_train():
     for name in ("svm_model.py", "arima_model.py", "garch_model.py"):
         calls = _function_calls(ROOT / name, "main")
@@ -41,7 +47,7 @@ def test_classic_model_endpoints_never_train():
         assert "retrain_one" not in calls
 
 
-def test_both_models_have_a_scheduled_retraining_function():
+def test_trend_models_have_a_scheduled_retraining_function():
     schedules = {
         "lstm_trend_model.py": 'schedule=modal.Cron("0 20 * * 1-5"',
         "xgboost_trend_model.py": 'schedule=modal.Cron("0 21 * * 1-5"',
@@ -65,3 +71,15 @@ def test_classic_models_train_all_tickers_on_a_schedule():
         assert schedule in source
         assert "for ticker in fetch_available_tickers():" in source
         assert "def retrain_models()" in source
+
+
+def test_transformer_is_triggered_by_the_lstm_cron_not_its_own():
+    # Limite de 5 crons del plan gratis de Modal: el Transformer no tiene
+    # `schedule=`, lo dispara el job del LSTM.
+    transformer = (ROOT / "transformer_trend_model.py").read_text()
+    assert "schedule=" not in transformer.replace("# Sin `schedule=` propio", "")
+    assert "def retrain_models()" in transformer
+    assert "fetch_available_tickers()" in transformer
+    assert 'from_name("transformer-trend-model", "retrain_models")' in (
+        ROOT / "lstm_trend_model.py"
+    ).read_text()
