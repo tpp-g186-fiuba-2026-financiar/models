@@ -1,21 +1,24 @@
-"""Modelo LSTM de tendencia, portado a Modal desde api-ml.
+"""Modelo Transformer de tendencia, portado a Modal desde api-ml.
 
-Parte de las mismas features y el mismo target que `api-ml/src/lstm.py`
-(retornos log de precio/volumen + rango %, indicadores tecnicos --
-RSI/SMA/MACD/momentum -- y una tasa de interes exogena; target = retorno
-log acumulado a `horizon` ruedas, elegible por quien pide la prediccion
-entre `MIN_HORIZON` y `MAX_HORIZON`), mas 2 features propias de este repo
-que salieron del EDA (ver `FEATURE_NAMES`). Entrenado on-demand con los
-datos de cada ticker configurado. Un cron diario en dias habiles hace backtest, promocion
-y persistencia en un Modal Volume; el endpoint solo ejecuta inferencia.
+Mismo criterio que `lstm_trend_model.py` y `xgboost_trend_model.py` en este
+mismo directorio: misma logica de features/target base que
+`api-ml/src/transformer.py` (que reusa el feature engineering de
+`api-ml/src/lstm.py`: retornos log de precio/volumen + rango %,
+indicadores tecnicos -- RSI/SMA/MACD/momentum -- y una tasa de interes
+exogena; target = retorno log acumulado a `horizon` ruedas). La red es un
+encoder de Transformer con token [CLS] y embedding posicional aprendido.
 
-(api-ml en cambio entrena un unico modelo global pooleando los tickers
-disponibles -- acá se prioriza consistencia con el resto de este repo por
-sobre replicar ese diseño puntual.)
+El reentrenamiento diario (dias habiles) hace backtest, promocion y
+persistencia en un Modal Volume (lo dispara el cron del LSTM, ver
+`retrain_models`); el endpoint solo ejecuta inferencia (nunca entrena).
 
-Si se cambia la logica de features/target en api-ml hay que replicar el
-cambio aca a mano -- son dos copias independientes a proposito, para que
-esto funcione aunque el servicio de api-ml en Render este caido.
+Igual que `xgboost_trend_model.py`, se queda con las 8 features de
+api-ml (no suma `dist_max60`/`rsi_vol_interaction`, que son propias del
+LSTM de este repo y no se validaron con esta arquitectura).
+
+Si se cambia la logica en api-ml hay que replicarla aca a mano -- es una
+copia independiente a proposito, para que esto funcione aunque el
+servicio de api-ml en Render este caido.
 """
 
 import json
@@ -32,9 +35,9 @@ import requests
 image = modal.Image.debian_slim().pip_install(
     "fastapi[standard]", "torch", "numpy", "pandas", "requests"
 )
-app = modal.App("lstm-trend-model")
+app = modal.App("transformer-trend-model")
 artifact_volume = modal.Volume.from_name("trend-model-artifacts", create_if_missing=True)
-ARTIFACT_ROOT = Path("/artifacts/lstm")
+ARTIFACT_ROOT = Path("/artifacts/transformer")
 BACKTEST_DAYS = 60
 
 DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
@@ -48,12 +51,8 @@ def fetch_available_tickers() -> list[str]:
     if not tickers:
         raise ValueError("data-colector no devolvio tickers disponibles")
     return sorted({str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()})
-# Las 2 ultimas salen del EDA (issue #135, api-ml/notebooks/eda.ipynb,
-# secciones 13.b/13.c) y se validaron con backtest walk-forward (issue #160,
-# `scripts/tune_features_and_horizon.py`): sumarlas subio el acierto
-# direccional de 50.4% a 58.3% en LSTM. En XGBoost dieron peor (por eso ese
-# archivo se quedo con las 8 de siempre, ver xgboost_trend_model.py) -- no
-# son "mejores porque si", ayudan a este modelo en particular.
+# Las mismas 8 features que `api-ml/src/lstm.py::FEATURE_NAMES` (que usa
+# tambien el Transformer de api-ml) y que `xgboost_trend_model.py`.
 FEATURE_NAMES = [
     "log_return",
     "log_volume_change",
@@ -63,17 +62,25 @@ FEATURE_NAMES = [
     "macd_norm",
     "momentum_10",
     "macro_rate_chg5",
-    "dist_max60",
-    "rsi_vol_interaction",
 ]
-# WINDOW/hidden_size/num_layers salen de una busqueda con backtest
-# walk-forward (issue #160, `scripts/tune_hyperparams.py`, resultados en
-# `scripts/TUNING_RESULTS.md`) sobre GGAL/YPFD/ALUA -- antes eran valores a
-# ojo (30, 1 capa). 2 capas le gano claro a 1 (63.3% vs 56.8% de acierto
-# direccional). Ojo: la busqueda uso solo 3 tickers y ~570 predicciones --
-# prometedor pero no concluyente, revisar si con mas tickers/mas historia
-# se sostiene.
-WINDOW = 45
+# Hiperparametros de `api-ml/src/transformer.py::TransformerTrainConfig`
+# (ventana de 30 ruedas, d_model=32, 4 cabezas, 2 capas). Todavia no se
+# hizo una busqueda propia con backtest walk-forward para este archivo como
+# la del LSTM/XGBoost (issue #160): son los valores con los que ya corre el
+# Transformer local de api-ml.
+WINDOW = 30
+D_MODEL = 32
+NHEAD = 4
+NUM_LAYERS = 2
+DIM_FEEDFORWARD = 64
+DROPOUT = 0.1
+EPOCHS = 40
+BATCH_SIZE = 64
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+WARMUP_EPOCHS = 3
+PATIENCE = 8
+VAL_FRACTION = 0.15
 # El horizonte de prediccion es un parametro de `main()`, no una constante
 # fija -- un horizonte de 10 dias predecia mejor en el backtest, pero para
 # el cliente final es poco util ("¿en 10 dias, subio o bajo?" dice poco el
@@ -252,11 +259,8 @@ def macd_histogram(close: np.ndarray, fast: int = 12, slow: int = 26, signal: in
 
 
 def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
-    """Retornos log de precio/volumen + rango %, indicadores tecnicos
-    (RSI/SMA/MACD/momentum), tasa macro exogena, y 2 features del EDA
-    (issue #135): distancia al maximo de 60 ruedas y la interaccion
-    RSI x volumen. Target = retorno log acumulado a `horizon` ruedas.
-    """
+    """Identico a `api-ml/src/lstm.py::build_features` (LSTM/XGBoost/Transformer
+    en api-ml comparten el mismo feature engineering)."""
     close = df["close"].to_numpy(dtype=np.float64)
     volume = df["volume"].to_numpy(dtype=np.float64)
     high = df["high"].to_numpy(dtype=np.float64)
@@ -281,23 +285,6 @@ def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
     macro_chg5 = np.full(len(close), np.nan)
     macro_chg5[5:] = macro_rate[5:] - macro_rate[:-5]
 
-    # dist_max60: que tan lejos esta el precio de hoy del maximo de los
-    # ultimos 60 dias (0 = esta en el maximo, negativo = por debajo). En el
-    # EDA fue la feature con mas señal de las 10 -- capta rebotes despues de
-    # una caida fuerte, algo que RSI/SMA20 no ven porque miran ventanas mas
-    # cortas (14 y 20 dias).
-    roll_max60 = df["close"].rolling(60, min_periods=30).max().to_numpy(dtype=np.float64)
-    dist_max60 = close / np.where(roll_max60 == 0, np.nan, roll_max60) - 1.0
-
-    # rsi_vol_interaction: RSI normalizado x volumen "raro" (z-score contra
-    # el promedio propio de 60 dias). En el EDA, "volumen alto + RSI en zona
-    # media" predecia mas que cualquiera de las dos por separado.
-    vol_series = df["volume"].astype(float)
-    roll_mean_vol = vol_series.rolling(60, min_periods=20).mean()
-    roll_std_vol = vol_series.rolling(60, min_periods=20).std()
-    vol_z = ((vol_series - roll_mean_vol) / roll_std_vol.replace(0, np.nan)).to_numpy(dtype=np.float64)
-    rsi_vol_interaction = rsi_norm * np.nan_to_num(vol_z, nan=0.0, posinf=0.0, neginf=0.0)
-
     feats = np.column_stack(
         [
             log_return,
@@ -308,8 +295,6 @@ def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
             macd_norm[1:],
             momentum_10[1:],
             macro_chg5[1:],
-            dist_max60[1:],
-            rsi_vol_interaction[1:],
         ]
     )
 
@@ -382,28 +367,47 @@ def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutr
     }
 
 
-def build_lstm_network():
+def build_transformer_network():
+    import math
+
     import torch
     from torch import nn
 
-    class _LSTMRegressor(nn.Module):
+    class _TransformerRegressor(nn.Module):
+        """Encoder de Transformer con token [CLS] para regresion de secuencias
+        (misma arquitectura que `api-ml/src/transformer.py`)."""
+
         def __init__(self):
             super().__init__()
-            self.lstm = nn.LSTM(
-                input_size=len(FEATURE_NAMES), hidden_size=32, num_layers=2,
-                batch_first=True, dropout=0.1,
+            self.input_proj = nn.Linear(len(FEATURE_NAMES), D_MODEL)
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, D_MODEL))
+            nn.init.trunc_normal_(self.cls_token, std=0.02)
+            # +1 por el token [CLS] que se antepone a la secuencia.
+            self.pos_embedding = nn.Parameter(torch.zeros(1, WINDOW + 1, D_MODEL))
+            nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+            layer = nn.TransformerEncoderLayer(
+                d_model=D_MODEL, nhead=NHEAD, dim_feedforward=DIM_FEEDFORWARD,
+                dropout=DROPOUT, batch_first=True, activation="gelu",
             )
-            self.head = nn.Linear(32, 1)
+            self.encoder = nn.TransformerEncoder(layer, num_layers=NUM_LAYERS)
+            self.norm = nn.LayerNorm(D_MODEL)
+            self.head = nn.Linear(D_MODEL, 1)
 
         def forward(self, x):
-            out, _ = self.lstm(x)
-            return self.head(out[:, -1, :]).squeeze(-1)
+            h = self.input_proj(x) * math.sqrt(D_MODEL)
+            cls = self.cls_token.expand(x.size(0), -1, -1)
+            h = torch.cat([cls, h], dim=1)
+            h = h + self.pos_embedding[:, : h.size(1), :]
+            h = self.encoder(h)
+            return self.head(self.norm(h[:, 0, :])).squeeze(-1)
 
-    return _LSTMRegressor()
+    return _TransformerRegressor()
 
 
 @app.function()
-def train_lstm(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
+def train_transformer(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
+    import math
+
     import torch
     from torch import nn
 
@@ -414,35 +418,72 @@ def train_lstm(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
             f"no hay suficientes ruedas para entrenar (se necesitan al menos ~{WINDOW + horizon + 30})"
         )
 
-    flat = X.reshape(-1, X.shape[-1])
+    # Split temporal (las ultimas ventanas quedan para early stopping) y
+    # normalizacion calculada solo con el set de entrenamiento.
+    split = int(len(X) * (1 - VAL_FRACTION))
+    X_train, y_train, X_val, y_val = X[:split], y[:split], X[split:], y[split:]
+    flat = X_train.reshape(-1, X_train.shape[-1])
     feature_mean = flat.mean(axis=0)
     feature_std = flat.std(axis=0) + 1e-8
-    target_mean = float(y.mean())
-    target_std = float(y.std() + 1e-8)
+    target_mean = float(y_train.mean())
+    target_std = float(y_train.std() + 1e-8)
 
-    X_scaled = (X - feature_mean) / feature_std
-    X_t = torch.tensor(X_scaled, dtype=torch.float32)
-    y_t = torch.tensor((y - target_mean) / target_std, dtype=torch.float32)
+    def to_tensor(values):
+        return torch.tensor(values, dtype=torch.float32)
+
+    X_t = to_tensor((X_train - feature_mean) / feature_std)
+    y_t = to_tensor((y_train - target_mean) / target_std)
+    has_val = len(X_val) > 0
+    if has_val:
+        X_val_t = to_tensor((X_val - feature_mean) / feature_std)
+        y_val_t = to_tensor((y_val - target_mean) / target_std)
 
     torch.manual_seed(42)
-    net = build_lstm_network()
-    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    net = build_transformer_network()
+    optimizer = torch.optim.AdamW(net.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+    # Warmup lineal + decaimiento coseno: lo estandar para estabilizar el
+    # entrenamiento de un Transformer, incluso uno chico como este.
+    def lr_lambda(epoch: int) -> float:
+        if epoch < WARMUP_EPOCHS:
+            return (epoch + 1) / WARMUP_EPOCHS
+        progress = (epoch - WARMUP_EPOCHS) / max(1, EPOCHS - WARMUP_EPOCHS)
+        return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     loss_fn = nn.MSELoss()
 
     n = len(X_t)
-    batch_size = 64
-    epochs = 40
-    for epoch in range(epochs):
+    best_val = float("inf")
+    best_state = None
+    epochs_without_improvement = 0
+    for _ in range(EPOCHS):
         net.train()
         perm = torch.randperm(n)
-        for start in range(0, n, batch_size):
-            idx = perm[start : start + batch_size]
+        for start in range(0, n, BATCH_SIZE):
+            idx = perm[start : start + BATCH_SIZE]
             optimizer.zero_grad()
-            pred = net(X_t[idx])
-            loss = loss_fn(pred, y_t[idx])
+            loss = loss_fn(net(X_t[idx]), y_t[idx])
             loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
+        scheduler.step()
 
+        if has_val:
+            net.eval()
+            with torch.no_grad():
+                val_loss = float(loss_fn(net(X_val_t), y_val_t).item())
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = {k: v.clone() for k, v in net.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= PATIENCE:
+                    break
+
+    if best_state is not None:
+        net.load_state_dict(best_state)
     net.eval()
     return {
         "net_state": net.state_dict(),
@@ -453,11 +494,11 @@ def train_lstm(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
     }
 
 
-def predict_lstm_state(state: dict, window: np.ndarray) -> float:
+def predict_transformer_state(state: dict, window: np.ndarray) -> float:
     import torch
 
     scaled = (window - state["feature_mean"]) / state["feature_std"]
-    net = build_lstm_network()
+    net = build_transformer_network()
     net.load_state_dict(state["net_state"])
     net.eval()
     with torch.no_grad():
@@ -465,18 +506,19 @@ def predict_lstm_state(state: dict, window: np.ndarray) -> float:
     return pred_scaled * state["target_std"] + state["target_mean"]
 
 
-def backtest_lstm(df: pd.DataFrame, horizon: int) -> dict:
+def backtest_transformer(df: pd.DataFrame, horizon: int) -> dict:
+    """Holdout temporal: el candidato nunca ve las ultimas ruedas evaluadas."""
     split = len(df) - BACKTEST_DAYS - horizon
     if split < WINDOW + horizon + 30:
         raise ValueError("no hay suficiente historia para el backtest temporal")
-    state = train_lstm.local(df.iloc[:split], horizon)
+    state = train_transformer.local(df.iloc[:split], horizon)
     feats, target = build_features(df, horizon)
     predicted, actual, evaluation_series = [], [], []
     for feature_day in range(max(WINDOW, split - 1), len(feats)):
         if np.isnan(target[feature_day]):
             continue
         window = feats[feature_day - WINDOW + 1 : feature_day + 1][None, :, :]
-        predicted_return = predict_lstm_state(state, window)
+        predicted_return = predict_transformer_state(state, window)
         actual_return = float(target[feature_day])
         predicted.append(predicted_return)
         actual.append(actual_return)
@@ -506,7 +548,7 @@ def retrain_one(ticker: str, horizon: int) -> dict:
     ticker = ticker.strip().upper()
     df, repaired = clean_dataframe(fetch_ticker_history(ticker))
     df = attach_macro_feature(df, fetch_macro_series())
-    metrics = backtest_lstm(df, horizon)
+    metrics = backtest_transformer(df, horizon)
     path = _artifact_path(ticker, horizon)
     incumbent_score = -1.0
     incumbent_has_series = False
@@ -518,7 +560,7 @@ def retrain_one(ticker: str, horizon: int) -> dict:
     promoted = metrics["directional_accuracy"] > incumbent_score or not incumbent_has_series
     if promoted:
         artifact = {
-            "state": train_lstm.local(df, horizon), "metrics": metrics,
+            "state": train_transformer.local(df, horizon), "metrics": metrics,
             "ticker": ticker, "horizon": horizon,
             "trained_at": datetime.now(timezone.utc).isoformat(),
             "training_data_as_of": df.index[-1].strftime("%Y-%m-%d"),
@@ -533,21 +575,17 @@ def retrain_one(ticker: str, horizon: int) -> dict:
     return {"ticker": ticker, "horizon": horizon, "promoted": promoted, "metrics": metrics}
 
 
+# Sin `schedule=` propio a proposito: el plan gratis de Modal permite 5
+# funciones programadas por workspace y ya estan ocupadas (LSTM, XGBoost,
+# SVM, ARIMA y GARCH). El job diario del LSTM (`lstm_trend_model.py`,
+# 20:00 ART) dispara esta funcion con `.spawn()`, asi se reentrena igual
+# cada dia habil sin gastar un cron. A mano: `modal run
+# modelos/transformer_trend_model.py::retrain_models`.
 @app.function(
     image=image, volumes={"/artifacts": artifact_volume},
-    schedule=modal.Cron("0 20 * * 1-5", timezone="America/Argentina/Buenos_Aires"),
     timeout=86400, cpu=1.0, memory=1024,
 )
 def retrain_models() -> list[dict]:
-    # Este es el unico cron que dispara al Transformer: el plan gratis de
-    # Modal limita a 5 funciones programadas y no queda lugar para uno propio.
-    # `.spawn()` lo corre en paralelo, en su propio contenedor; si falla (por
-    # ejemplo, todavia no esta desplegado) no debe frenar el reentrenamiento
-    # del LSTM.
-    try:
-        modal.Function.from_name("transformer-trend-model", "retrain_models").spawn()
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [warn] no se pudo disparar el reentrenamiento del Transformer: {exc}")
     results = []
     for ticker in fetch_available_tickers():
         for horizon in range(MIN_HORIZON, MAX_HORIZON + 1):
@@ -617,11 +655,11 @@ def main(ticker: str, horizon: int = DEFAULT_HORIZON):
 
     feats, _ = build_features(df, horizon)
     window = feats[-WINDOW:][None, :, :]
-    log_return = predict_lstm_state(artifact["state"], window)
+    log_return = predict_transformer_state(artifact["state"], window)
 
     result = derive_trend_output(df, log_return, horizon)
     result["ticker"] = ticker
-    result["model"] = "lstm"
+    result["model"] = "transformer"
     result["source"] = "modal (artefacto preentrenado)"
     result["model_version"] = artifact["trained_at"]
     result["backtest"] = artifact["metrics"]
