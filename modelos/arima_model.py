@@ -18,7 +18,8 @@ artifact_volume = modal.Volume.from_name("arima-model-artifacts", create_if_miss
 ARTIFACT_ROOT = Path("/artifacts")
 DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
 MEDIA_MOVIL = 20
-BACKTEST_DAYS = 30
+BACKTEST_HORIZON = 5
+NEUTRAL_BAND = 0.01
 
 
 def fetch_available_tickers() -> list[str]:
@@ -77,31 +78,99 @@ def train_model(values: list[float], media_movil: int = MEDIA_MOVIL):
     return ARIMA(pd.Series(values), order=(1, 1, media_movil)).fit()
 
 
+# Backtest walk-forward: hasta BACKTEST_FOLDS tramos consecutivos de
+# BACKTEST_FOLD_DAYS ruedas. En cada tramo se ajusta ARIMA SOLO con lo anterior
+# y se predice a BACKTEST_HORIZON ruedas desde origenes separados esa misma
+# cantidad de ruedas (casos independientes), comparando la direccion predicha
+# contra la que realmente ocurrio. Antes se hacia UNA sola prediccion de 30 dias
+# y se contaba cada dia del forecast como un caso: el modelo "acertaba" ~90%
+# solo por quedar del mismo lado que el punto de partida durante una racha,
+# aunque el precio predicho estuviera muy lejos del real. Eso no es lo que
+# hace el modelo en produccion (predicciones a 5 dias) y no es comparable con
+# los demas modelos ni con paper trading.
+BACKTEST_FOLDS = 3
+BACKTEST_FOLD_DAYS = 40
+
+
+def wilson_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Intervalo de confianza (95%) de una proporcion: cuanta confianza dar a una accuracy."""
+    if n == 0:
+        return 0.0, 1.0
+    p = hits / n
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
+    return float(max(0.0, center - half)), float(min(1.0, center + half))
+
+
+def backtest_plan(n_rows: int, horizon: int, min_train: int) -> list[tuple[int, list[int]]]:
+    """[(split, [origenes])]: se ajusta con `[:split]` y se predice desde cada origen.
+
+    Un origen es el indice del ultimo cierre conocido. Si la historia no
+    alcanza para todos los tramos se usan menos; si no alcanza ni para uno, falla.
+    """
+    available = (n_rows - horizon - min_train) // BACKTEST_FOLD_DAYS
+    folds = min(BACKTEST_FOLDS, available)
+    if folds < 1:
+        raise ValueError("historia insuficiente para backtest")
+    first_split = n_rows - horizon - folds * BACKTEST_FOLD_DAYS
+    return [
+        (split, list(range(split - 1, split - 1 + BACKTEST_FOLD_DAYS, horizon)))
+        for split in (first_split + fold * BACKTEST_FOLD_DAYS for fold in range(folds))
+    ]
+
+
+def backtest_arima(values: list[float], horizon: int = BACKTEST_HORIZON) -> dict:
+    plan = backtest_plan(len(values), horizon, MEDIA_MOVIL + 30)
+    predicted, actual, origin_close, evaluation_series = [], [], [], []
+    for split, origins in plan:
+        state = train_model.local(values[:split], MEDIA_MOVIL)
+        known = split - 1  # ultimo indice que el modelo ya "vio"
+        for origin in origins:
+            if origin + horizon >= len(values):
+                continue
+            if origin > known:
+                # Actualiza el estado con las ruedas nuevas sin reajustar parametros
+                # (no mira nada posterior al origen).
+                new = pd.Series(values[known + 1 : origin + 1], index=pd.RangeIndex(known + 1, origin + 1))
+                state = state.append(new, refit=False)
+                known = origin
+            forecast = float(np.asarray(state.forecast(steps=horizon), dtype=float)[-1])
+            predicted.append(forecast)
+            actual.append(values[origin + horizon])
+            origin_close.append(values[origin])
+            evaluation_series.append(
+                {"date": str(len(evaluation_series) + 1), "predicted": forecast, "actual": values[origin + horizon]}
+            )
+    if not actual:
+        raise ValueError("el backtest no produjo observaciones")
+    predicted_arr, actual_arr, base = map(np.asarray, (predicted, actual, origin_close))
+    hits = int(np.sum(np.sign(predicted_arr - base) == np.sign(actual_arr - base)))
+    low, high = wilson_interval(hits, len(actual_arr))
+    expected = predicted_arr / base - 1.0
+    position = np.where(expected > NEUTRAL_BAND, 1.0, np.where(expected < -NEUTRAL_BAND, -1.0, 0.0))
+    active = position != 0
+    return {
+        "directional_accuracy": hits / len(actual_arr),
+        "accuracy_low": low,
+        "accuracy_high": high,
+        "signal_hit_rate": (
+            float(np.mean(np.sign(actual_arr[active] - base[active]) == position[active]))
+            if active.any()
+            else None
+        ),
+        "neutral_rate": float(np.mean(~active)),
+        # En precio (no en retorno): la web lo muestra como % del ultimo cierre.
+        "mae": float(np.mean(np.abs(predicted_arr - actual_arr))),
+        "observations": len(actual_arr),
+        "folds": len(plan),
+        "series": evaluation_series[-30:],
+    }
+
+
 def retrain_one(ticker: str) -> dict:
     values = get_ticker_data(ticker)
-    if len(values) <= BACKTEST_DAYS + MEDIA_MOVIL + 5:
-        raise ValueError("historia insuficiente para backtest")
-    split = len(values) - BACKTEST_DAYS
-    candidate_test = train_model.local(values[:split], MEDIA_MOVIL)
-    forecast = np.asarray(candidate_test.forecast(steps=BACKTEST_DAYS), dtype=float)
-    actual = np.asarray(values[split:])
-    # Direccion de cada punto del forecast vs. el ultimo cierre conocido antes del
-    # test window (mismo origen que "signal" en los demas modelos: predicted vs
-    # last_close), no dia a dia -- el forecast de ARIMA es multi-step desde un
-    # unico origen, no rolling.
-    baseline = values[split - 1]
-    directional_accuracy = float(
-        np.mean(np.sign(forecast - baseline) == np.sign(actual - baseline))
-    )
-    metrics = {
-        "mae": float(np.mean(np.abs(forecast - actual))),
-        "observations": BACKTEST_DAYS,
-        "directional_accuracy": directional_accuracy,
-        "series": [
-            {"date": str(index + 1), "predicted": float(predicted), "actual": float(real)}
-            for index, (predicted, real) in enumerate(zip(forecast, actual))
-        ],
-    }
+    metrics = backtest_arima(values)
     path = ARTIFACT_ROOT / ticker / "production.pkl"
     incumbent_mae = float("inf")
     incumbent_has_series = False
@@ -109,7 +178,7 @@ def retrain_one(ticker: str) -> dict:
         with path.open("rb") as fh:
             incumbent = pickle.load(fh)
             incumbent_mae = float(incumbent["metrics"]["mae"])
-            incumbent_has_series = bool(incumbent["metrics"].get("series"))
+            incumbent_has_series = "folds" in incumbent["metrics"]  # metrica vieja: no comparable
     promoted = metrics["mae"] < incumbent_mae or not incumbent_has_series
     if promoted:
         artifact = {

@@ -83,7 +83,7 @@ def test_backtest_reports_direction_accuracy_and_series():
 
 def test_backtest_requires_enough_history():
     with pytest.raises(ValueError):
-        tm.backtest_transformer(_history(120), 5)
+        tm.backtest_transformer(_history(100), 5)
 
 
 def test_retrain_one_promotes_then_only_replaces_with_a_better_score(artifacts):

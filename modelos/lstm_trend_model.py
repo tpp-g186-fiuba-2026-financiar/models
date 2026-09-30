@@ -35,7 +35,6 @@ image = modal.Image.debian_slim().pip_install(
 app = modal.App("lstm-trend-model")
 artifact_volume = modal.Volume.from_name("trend-model-artifacts", create_if_missing=True)
 ARTIFACT_ROOT = Path("/artifacts/lstm")
-BACKTEST_DAYS = 60
 
 DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
 
@@ -465,37 +464,99 @@ def predict_lstm_state(state: dict, window: np.ndarray) -> float:
     return pred_scaled * state["target_std"] + state["target_mean"]
 
 
-def backtest_lstm(df: pd.DataFrame, horizon: int) -> dict:
-    split = len(df) - BACKTEST_DAYS - horizon
-    if split < WINDOW + horizon + 30:
+# Backtest walk-forward: hasta BACKTEST_FOLDS tramos consecutivos de
+# BACKTEST_FOLD_DAYS ruedas. En cada tramo el modelo se entrena SOLO con lo
+# anterior y predice desde origenes separados `horizon` ruedas (sin
+# solapamiento, asi cada caso es independiente) contra el retorno que de verdad
+# ocurrio a `horizon` ruedas. Con una sola ventana de ~60 dias el "mejor"
+# modelo era el que tuvo suerte en ese tramo; con varios tramos y casos
+# independientes la accuracy se parece mucho mas a lo que se ve en paper trading.
+BACKTEST_FOLDS = 3
+BACKTEST_FOLD_DAYS = 40
+
+
+def wilson_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Intervalo de confianza (95%) de una proporcion: cuanta confianza dar a una accuracy."""
+    if n == 0:
+        return 0.0, 1.0
+    p = hits / n
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
+    return float(max(0.0, center - half)), float(min(1.0, center + half))
+
+
+def backtest_plan(n_rows: int, horizon: int, min_train: int) -> list[tuple[int, list[int]]]:
+    """[(split, [origenes])]: entrena con `[:split]`, predice desde cada origen.
+
+    Si la historia no alcanza para todos los tramos se usan menos; si no
+    alcanza ni para uno, falla (mismo criterio que antes).
+    """
+    available = (n_rows - horizon - min_train) // BACKTEST_FOLD_DAYS
+    folds = min(BACKTEST_FOLDS, available)
+    if folds < 1:
         raise ValueError("no hay suficiente historia para el backtest temporal")
-    state = train_lstm.local(df.iloc[:split], horizon)
-    feats, target = build_features(df, horizon)
-    predicted, actual, evaluation_series = [], [], []
-    for feature_day in range(max(WINDOW, split - 1), len(feats)):
-        if np.isnan(target[feature_day]):
-            continue
-        window = feats[feature_day - WINDOW + 1 : feature_day + 1][None, :, :]
-        predicted_return = predict_lstm_state(state, window)
-        actual_return = float(target[feature_day])
-        predicted.append(predicted_return)
-        actual.append(actual_return)
-        base_day = feature_day + 1
-        future_day = base_day + horizon
-        evaluation_series.append({
-            "date": df.index[future_day].strftime("%Y-%m-%d"),
-            "predicted": float(df["close"].iloc[base_day] * np.exp(predicted_return)),
-            "actual": float(df["close"].iloc[future_day]),
-        })
-    if not actual:
-        raise ValueError("el backtest no produjo observaciones")
-    predicted_arr, actual_arr = np.asarray(predicted), np.asarray(actual)
+    first_split = n_rows - horizon - folds * BACKTEST_FOLD_DAYS
+    return [
+        (split, list(range(split - 1, split - 1 + BACKTEST_FOLD_DAYS, horizon)))
+        for split in (first_split + fold * BACKTEST_FOLD_DAYS for fold in range(folds))
+    ]
+
+
+def summarize_backtest(predicted, actual, evaluation_series: list[dict], folds: int, mae: float) -> dict:
+    """Metricas del backtest: accuracy con intervalo de confianza y sobre la senal real.
+
+    `directional_accuracy` cuenta el signo de cada prediccion; `signal_hit_rate`
+    y `neutral_rate` usan la misma banda neutral que la senal que ve el usuario.
+    """
+    predicted_arr, actual_arr = np.asarray(predicted, dtype=float), np.asarray(actual, dtype=float)
+    n = len(actual_arr)
+    hits = int(np.sum(np.sign(predicted_arr) == np.sign(actual_arr)))
+    low, high = wilson_interval(hits, n)
+    expected = np.expm1(predicted_arr)
+    position = np.where(expected > NEUTRAL_BAND, 1.0, np.where(expected < -NEUTRAL_BAND, -1.0, 0.0))
+    active = position != 0
     return {
-        "directional_accuracy": float(np.mean(np.sign(predicted_arr) == np.sign(actual_arr))),
-        "mae": float(np.mean(np.abs(predicted_arr - actual_arr))),
-        "observations": len(actual),
+        "directional_accuracy": hits / n,
+        "accuracy_low": low,
+        "accuracy_high": high,
+        "signal_hit_rate": (
+            float(np.mean(np.sign(actual_arr[active]) == position[active])) if active.any() else None
+        ),
+        "neutral_rate": float(np.mean(~active)),
+        "mae": mae,
+        "observations": n,
+        "folds": folds,
         "series": evaluation_series[-30:],
     }
+
+
+def backtest_lstm(df: pd.DataFrame, horizon: int) -> dict:
+    """Walk-forward: ver `backtest_plan`. El candidato nunca ve lo que evalua."""
+    plan = backtest_plan(len(df), horizon, WINDOW + horizon + 30)
+    feats, target = build_features(df, horizon)
+    predicted, actual, evaluation_series = [], [], []
+    for split, origins in plan:
+        state = train_lstm.local(df.iloc[:split], horizon)
+        for feature_day in origins:
+            if np.isnan(target[feature_day]):
+                continue
+            window = feats[feature_day - WINDOW + 1 : feature_day + 1][None, :, :]
+            predicted_return = predict_lstm_state(state, window)
+            actual_return = float(target[feature_day])
+            predicted.append(predicted_return)
+            actual.append(actual_return)
+            base_day = feature_day + 1
+            future_day = base_day + horizon
+            evaluation_series.append({
+                "date": df.index[future_day].strftime("%Y-%m-%d"),
+                "predicted": float(df["close"].iloc[base_day] * np.exp(predicted_return)),
+                "actual": float(df["close"].iloc[future_day]),
+            })
+    if not actual:
+        raise ValueError("el backtest no produjo observaciones")
+    mae = float(np.mean(np.abs(np.asarray(predicted) - np.asarray(actual))))
+    return summarize_backtest(predicted, actual, evaluation_series, len(plan), mae)
 
 
 def _artifact_path(ticker: str, horizon: int) -> Path:
@@ -514,7 +575,7 @@ def retrain_one(ticker: str, horizon: int) -> dict:
         with path.open("rb") as fh:
             incumbent = pickle.load(fh)
             incumbent_score = float(incumbent["metrics"]["directional_accuracy"])
-            incumbent_has_series = bool(incumbent["metrics"].get("series"))
+            incumbent_has_series = "folds" in incumbent["metrics"]  # metrica vieja: no comparable
     promoted = metrics["directional_accuracy"] > incumbent_score or not incumbent_has_series
     if promoted:
         artifact = {
