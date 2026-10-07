@@ -79,6 +79,11 @@ def retrain_one(ticker: str) -> dict:
     cpu=1.0, memory=512,
 )
 def retrain_models() -> list[dict]:
+    # Sin cron propio para GARCH-ANN (limite de 5 del plan gratis): lo dispara este job.
+    try:
+        modal.Function.from_name("garch-ann-model", "retrain_models").spawn()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [warn] no se pudo disparar el reentrenamiento de GARCH-ANN: {exc}")
     results = []
     for ticker in fetch_available_tickers():
         try:

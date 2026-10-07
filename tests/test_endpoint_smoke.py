@@ -12,6 +12,7 @@ romperse y responda un dict en vez de tirar una excepcion.
 from unittest.mock import patch
 
 import arima_model
+import garch_ann_model
 import garch_model
 import lstm_trend_model
 import svm_model
@@ -58,4 +59,10 @@ def test_garch_endpoint_responds():
 def test_transformer_endpoint_responds():
     with patch.object(transformer_trend_model.artifact_volume, "reload", return_value=None):
         result = transformer_trend_model.main.local(ticker="GGAL")
+    _assert_responds_gracefully(result)
+
+
+def test_garch_ann_endpoint_responds():
+    with patch.object(garch_ann_model.artifact_volume, "reload", return_value=None):
+        result = garch_ann_model.main.local(ticker="GGAL")
     _assert_responds_gracefully(result)
