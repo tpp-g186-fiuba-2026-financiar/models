@@ -1,6 +1,7 @@
 import json
 import os
 import pickle
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,8 +23,28 @@ BACKTEST_HORIZON = 5
 NEUTRAL_BAND = 0.01
 
 
+def _post_with_retry(url: str, timeout: int = 90, attempts: int = 4) -> requests.Response:
+    """POST al data-colector tolerando el arranque en frio de Render.
+
+    El plan gratuito duerme el servicio y despertarlo tarda mas de 30 s: con
+    el timeout viejo el cron fallaba sin reintentar. Se reintenta ante
+    timeouts, errores de conexion y 5xx (502/503 mientras levanta).
+    """
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = requests.post(url, timeout=timeout)
+            if response.status_code < 500:
+                return response
+            last_error = requests.HTTPError(f"{response.status_code} en {url}", response=response)
+        except (requests.Timeout, requests.ConnectionError) as error:
+            last_error = error
+        if attempt < attempts - 1:
+            time.sleep(5 * 2**attempt)
+    raise last_error
+
 def fetch_available_tickers() -> list[str]:
-    response = requests.post(f"{DATA_COLLECTOR_URL}/available-tickers", timeout=30)
+    response = _post_with_retry(f"{DATA_COLLECTOR_URL}/available-tickers")
     response.raise_for_status()
     payload = response.json()
     tickers = payload.get("tickers") or (payload.get("message") or {}).get("tickers") or []
@@ -33,7 +54,7 @@ def fetch_available_tickers() -> list[str]:
 
 
 def get_ticker_rows(ticker: str) -> list[dict]:
-    response = requests.post(f"{DATA_COLLECTOR_URL}/historical-data/{ticker}", timeout=30)
+    response = _post_with_retry(f"{DATA_COLLECTOR_URL}/historical-data/{ticker}")
     response.raise_for_status()
     rows = response.json().get("data") or []
     if not rows:
