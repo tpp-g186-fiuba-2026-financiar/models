@@ -1,4 +1,4 @@
-"""Tests del backtest walk-forward compartido por ARIMA, XGBoost, LSTM y Transformer.
+"""Tests del backtest walk-forward compartido por ARIMA, LSTM y Transformer.
 
 Sin red ni Modal. Lo que se verifica es lo que hace que el backtest sirva para
 comparar modelos: que nunca entrene con datos que despues evalua, que cada
@@ -12,9 +12,8 @@ import pytest
 import arima_model
 import lstm_trend_model as lstm
 import transformer_trend_model as transformer
-import xgboost_trend_model as xgb
 
-PLAN_MODULES = [arima_model, xgb, lstm, transformer]
+PLAN_MODULES = [arima_model, lstm, transformer]
 
 
 def _history(n: int = 420, seed: int = 0) -> pd.DataFrame:
@@ -62,16 +61,16 @@ def test_plan_uses_fewer_folds_with_short_history_and_fails_without_history(modu
 
 
 def test_wilson_interval_narrows_with_more_cases():
-    small = xgb.wilson_interval(6, 10)
-    large = xgb.wilson_interval(600, 1000)
+    small = lstm.wilson_interval(6, 10)
+    large = lstm.wilson_interval(600, 1000)
     assert (small[1] - small[0]) > 5 * (large[1] - large[0])
-    assert xgb.wilson_interval(0, 0) == (0.0, 1.0)
+    assert lstm.wilson_interval(0, 0) == (0.0, 1.0)
 
 
 def test_summary_distinguishes_direction_from_real_signal():
     # Predice siempre +0.2% (por debajo de la banda neutral de 1%) y sube siempre:
     # acierta la direccion el 100% pero nunca emite una senal alza/baja.
-    metrics = xgb.summarize_backtest([0.002] * 20, [0.03] * 20, [], folds=1, mae=0.0)
+    metrics = lstm.summarize_backtest([0.002] * 20, [0.03] * 20, [], folds=1, mae=0.0)
     assert metrics["directional_accuracy"] == 1.0
     assert metrics["neutral_rate"] == 1.0
     assert metrics["signal_hit_rate"] is None
@@ -114,30 +113,6 @@ def test_arima_backtest_on_pure_noise_is_not_inflated():
         values = (100 * np.exp(np.cumsum(rng.normal(0, 0.01, 300)))).tolist()
         accuracies.append(arima_model.backtest_arima(values)["directional_accuracy"])
     assert 0.35 < float(np.mean(accuracies)) < 0.65
-
-
-def test_xgboost_backtest_never_trains_on_evaluated_data(monkeypatch):
-    # El booster real necesita libomp (no siempre instalado localmente); el
-    # walk-forward no depende de el, asi que se entrena un doble.
-    class Booster:
-        @staticmethod
-        def predict(window):
-            return [0.02]
-
-    seen = []
-    monkeypatch.setattr(
-        xgb,
-        "train_xgboost",
-        type("S", (), {"local": staticmethod(lambda d, h: seen.append(len(d)) or {"booster": Booster})}),
-    )
-    df = _history(420)
-    metrics = xgb.backtest_xgboost(df, 5)
-    plan = xgb.backtest_plan(len(df), 5, xgb.WINDOW + 5 + 30)
-    assert seen == [split for split, _ in plan]
-    assert metrics["folds"] == 3
-    assert metrics["observations"] == 24
-    assert {"accuracy_low", "accuracy_high", "signal_hit_rate", "neutral_rate"} <= set(metrics)
-    assert {"date", "predicted", "actual"} <= set(metrics["series"][0])
 
 
 @pytest.mark.parametrize(

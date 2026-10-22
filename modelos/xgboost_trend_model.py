@@ -1,19 +1,29 @@
-"""Modelo XGBoost de tendencia, portado a Modal desde api-ml.
+"""Modelo XGBoost de tendencia (v2), portado a Modal desde api-ml.
 
-Mismo criterio que `lstm_trend_model.py` en este mismo directorio: misma
-logica de features/target base que `api-ml/src/xgb_trend.py` (retornos log
-de precio/volumen + rango %, indicadores tecnicos -- RSI/SMA/MACD/momentum
--- y una tasa de interes exogena). Un cron diario en dias habiles hace backtest, promocion
-y persistencia en un Modal Volume; el endpoint solo ejecuta inferencia.
+Replica `api-ml/src/xgb_trend.py` (v2): un clasificador P(sube a 20 ruedas) con
+arboles chicos y regularizados, variables tecnicas + contexto de mercado y el
+**rango de cada variable frente al resto del universo ese mismo dia**. Solo
+opina (alza/baja) en los extremos, con umbrales calibrados fuera de muestra;
+en el resto devuelve `neutral`. Su accuracy global NO supera a "siempre sube":
+lo que mide es cuanto mejor que la tasa base acierta cuando opina.
 
-A diferencia de `lstm_trend_model.py`, este archivo se queda con las 8
-features de siempre (no suma `dist_max60`/`rsi_vol_interaction`): se
-probaron ahi tambien (issue #160) y dieron peor, no mejor -- ver la nota
-junto a `FEATURE_NAMES` mas abajo.
+A diferencia de la v1 (un modelo por ticker y horizonte 1-5), la v2 es UN modelo
+pooled sobre todo el universo y un horizonte fijo de 20 ruedas, porque la senal
+es cross-seccional: para rankear una accion hace falta ver a las demas ese dia.
+Por eso el cron diario hace dos cosas:
+
+- refresca una **foto de los pares** (ultimas filas de variables de cada accion
+  + contexto de mercado) en el Volume, para que el endpoint no tenga que bajar
+  20 historicos por request;
+- reentrena el modelo pooled solo si el artefacto no existe o tiene mas de
+  `RETRAIN_EVERY_DAYS` dias, y lo promueve solo si el AUC fuera de muestra
+  supera `MIN_AUC`.
+
+El endpoint solo ejecuta inferencia.
 
 Si se cambia la logica en api-ml hay que replicarla aca a mano -- es una
-copia independiente a proposito, para que esto funcione aunque el
-servicio de api-ml en Render este caido.
+copia independiente a proposito, para que esto funcione aunque el servicio de
+api-ml en Render este caido.
 """
 
 import json
@@ -33,15 +43,61 @@ image = (
     # xgboost necesita OpenMP en runtime (mismo motivo por el que el
     # Dockerfile de api-ml instala libgomp1). Las versiones nuevas de
     # xgboost (3.x) ademas requieren scikit-learn instalado para poder usar
-    # la API sklearn-compatible (XGBRegressor), aunque no se importe directo.
+    # la API sklearn-compatible (XGBClassifier), y sklearn se usa para el AUC.
     .apt_install("libgomp1")
     .pip_install("fastapi[standard]", "xgboost", "scikit-learn", "numpy", "pandas", "requests")
 )
 app = modal.App("xgboost-trend-model")
 artifact_volume = modal.Volume.from_name("trend-model-artifacts", create_if_missing=True)
 ARTIFACT_ROOT = Path("/artifacts/xgboost")
+MODEL_PATH = ARTIFACT_ROOT / "v2" / "production.pkl"
+PEERS_PATH = ARTIFACT_ROOT / "v2" / "peers.pkl"
 
 DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+
+HORIZON = 20
+DEFAULT_HORIZON = HORIZON
+MIN_ROWS = 260
+RETRAIN_EVERY_DAYS = 28
+MIN_AUC = 0.52  # AUC fuera de muestra minimo para promover un candidato
+SIGNAL_QUANTILE = 0.10  # alza/baja solo en el 10% mas extremo de cada lado
+OOS_FRACTION = 0.25
+OOS_FOLDS = 4
+N_SEEDS = 3
+HALF_LIFE_YEARS = 3.0
+MIN_PEERS = 5
+PEER_MAX_AGE_DAYS = 10
+PEER_TAIL_ROWS = 15
+MARKET_TAIL_ROWS = 150
+STALE_MAX_UNCHANGED = 0.30
+# Canasta de lideres que hace de proxy del Merval (fija: el contexto es
+# identico en entrenamiento y en prediccion).
+LEADERS = ("GGAL", "YPFD", "BMA", "PAMP", "TXAR", "ALUA", "TECO2", "CEPU")
+XGB_PARAMS = {
+    "max_depth": 2,
+    "n_estimators": 250,
+    "learning_rate": 0.03,
+    "subsample": 0.7,
+    "colsample_bytree": 0.6,
+    "min_child_weight": 200,
+    "reg_lambda": 10.0,
+}
+
+TECH_FEATURES = [
+    "t_ret1", "t_ret3", "t_ret5", "t_ret10", "t_ret20", "t_ret60", "t_ret120", "t_ret250",
+    "t_down_streak", "t_up_streak", "t_dd252", "t_dd60", "t_dist_min60", "t_new_low252",
+    "t_sma20", "t_sma50", "t_sma200", "t_death_cross", "t_gap", "t_gap_down",
+    "t_vol5", "t_vol20", "t_vol60", "t_vol_ratio5_20", "t_vol_ratio20_60", "t_downdev",
+    "t_skew20", "t_kurt20", "t_gk20", "t_gk_ratio", "t_volz", "t_volz_x_ret", "t_vol_chg5",
+    "t_obv_slope", "t_amihud", "t_rsi14", "t_rsi5", "t_macd", "t_stoch", "t_boll",
+]  # fmt: skip
+CONTEXT_FEATURES = [
+    "m_ret5", "m_ret20", "m_ret60", "m_vol20", "m_dd252", "m_breadth50",
+    "m_rel5", "m_rel20", "m_rel60", "m_beta60",
+]  # fmt: skip
+FEATURES = TECH_FEATURES + CONTEXT_FEATURES
+RANK_FEATURES = [f"r_{name}" for name in FEATURES]
+ALL_FEATURES = FEATURES + RANK_FEATURES
 
 
 def _post_with_retry(url: str, timeout: int = 90, attempts: int = 4) -> requests.Response:
@@ -64,6 +120,7 @@ def _post_with_retry(url: str, timeout: int = 90, attempts: int = 4) -> requests
             time.sleep(5 * 2**attempt)
     raise last_error
 
+
 def fetch_available_tickers() -> list[str]:
     response = _post_with_retry(f"{DATA_COLLECTOR_URL}/available-tickers")
     response.raise_for_status()
@@ -72,42 +129,6 @@ def fetch_available_tickers() -> list[str]:
     if not tickers:
         raise ValueError("data-colector no devolvio tickers disponibles")
     return sorted({str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()})
-FEATURE_NAMES = [
-    "log_return",
-    "log_volume_change",
-    "range_pct",
-    "rsi_norm",
-    "sma20_ratio",
-    "macd_norm",
-    "momentum_10",
-    "macro_rate_chg5",
-]
-# WINDOW sale de una busqueda con backtest walk-forward (issue #160,
-# `scripts/tune_hyperparams.py`, resultados en `scripts/TUNING_RESULTS.md`)
-# sobre GGAL/YPFD/ALUA -- antes era un valor a ojo (30, que resulto ser el
-# mejor igual). La arquitectura actual (300 arboles, profundidad 4) tambien
-# ya andaba bien, no hizo falta tocarla. Se probaron las 2 features nuevas
-# que sí ayudaron al LSTM (`dist_max60`/`rsi_vol_interaction`, ver
-# `scripts/tune_features_and_horizon.py`) pero ACA dieron peor (52.5% contra
-# 54.7% de acierto sin ellas) -- por eso este archivo se queda con las 8
-# features de siempre, a proposito. Ojo: la busqueda uso solo 3 tickers y
-# ~570-590 predicciones -- prometedor pero no concluyente.
-WINDOW = 30
-# El horizonte de prediccion es un parametro de `main()`, no una constante
-# fija -- ver la nota mas larga en lstm_trend_model.py sobre por que (10
-# dias predecia mejor pero es poco util para el cliente final; se probo 1-5
-# y el acierto crece con el horizonte tambien ahi, asi que el default es 5).
-DEFAULT_HORIZON = 5
-MIN_HORIZON = 1
-MAX_HORIZON = 5
-NEUTRAL_BAND = 0.01
-# Tasa de interes exogena (ver `fetch_macro_series`): rendimiento a 10 anios
-# del Tesoro de EEUU, proxy de apetito por riesgo global que afecta flujos a
-# mercados emergentes (Merval incluido). La alternativa local mas relevante
-# para acciones argentinas (BCRA: source="ar", series="TPM") dependia de una
-# API que estaba caida del lado de data-colector al portar esta feature.
-MACRO_RATE_SOURCE = "us"
-MACRO_RATE_SERIES = "TNX"
 
 
 def fetch_ticker_history(ticker: str) -> pd.DataFrame:
@@ -142,14 +163,10 @@ BAD_DATA_LOG_RETURN_THRESHOLD = 1.0
 def clean_close_series(
     close: np.ndarray, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD
 ) -> tuple[np.ndarray, int]:
-    """Repara saltos de precio que son casi seguro un error de dato, en vez
-    de descartar el ticker entero: capa (winsoriza) cualquier retorno diario
-    mas grande que `threshold` en valor absoluto y reconstruye la serie de
-    precios a partir de esos retornos ya capados. Asi todos los indicadores
-    que se calculan mas abajo (SMA, RSI, MACD, etc.) quedan sobre una serie
-    sana, en vez de arrastrar el salto por 20-60 ruedas. Devuelve la serie
-    reparada y cuantos dias se tuvieron que capar (0 en el caso normal, sin
-    nada que limpiar)."""
+    """Repara saltos de precio que son casi seguro un error de dato: capa
+    (winsoriza) cualquier retorno diario mas grande que `threshold` en valor
+    absoluto y reconstruye la serie de precios. Devuelve la serie reparada y
+    cuantos dias se tuvieron que capar."""
     log_close = np.log(close)
     log_return = np.diff(log_close)
     clipped = np.clip(log_return, -threshold, threshold)
@@ -158,56 +175,30 @@ def clean_close_series(
     return np.exp(log_close_clean), fixed
 
 
-def clean_dataframe(df: pd.DataFrame, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD) -> tuple[pd.DataFrame, int]:
-    """Aplica `clean_close_series` sobre la columna `close` de todo el
-    historico, una sola vez -- asi todo lo que consuma `df` despues (las
-    features, el entrenamiento, el ultimo precio que se le muestra al
-    cliente, el RSI de post-procesamiento) ve la misma serie ya reparada."""
+def clean_dataframe(
+    df: pd.DataFrame, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD
+) -> tuple[pd.DataFrame, int]:
     cleaned, fixed = clean_close_series(df["close"].to_numpy(dtype=np.float64), threshold)
     df = df.copy()
     df["close"] = cleaned
     return df, fixed
 
 
-def fetch_macro_series(source: str = MACRO_RATE_SOURCE, series: str = MACRO_RATE_SERIES):
-    """Serie de tasa de interes exogena (identico a `api-ml/src/data.py`).
-
-    `data-colector` responde siempre HTTP 200 y codifica el error real en el
-    body (``{"status": 500, "message": {...}}``) en vez de usar el status
-    code -- pasa justo con el endpoint de BCRA (``ar``/``TPM``) -- por eso se
-    valida ``payload["status"]`` ademas de ``raise_for_status()``. Nunca
-    propaga la excepcion: si falla, se loguea y se sigue sin esta feature
-    (queda en 0 via ``nan_to_num`` en ``build_features``) en vez de romper
-    la prediccion por una serie opcional.
-    """
-    try:
-        resp = _post_with_retry(f"{DATA_COLLECTOR_URL}/interest-rate/{source}/{series}")
-        resp.raise_for_status()
-        payload = resp.json()
-        if payload.get("status") != 200:
-            reason = (payload.get("message") or {}).get("error", "error desconocido")
-            raise ValueError(f"data-colector no pudo obtener {source}/{series}: {reason}")
-        rows = payload.get("data") or []
-        if not rows:
-            raise ValueError(f"data-colector no devolvio datos para {source}/{series}")
-        values = pd.Series(
-            [float(r["value"]) for r in rows],
-            index=pd.to_datetime([int(r["ts"]) for r in rows], unit="ms"),
-        )
-        return values[~values.index.duplicated(keep="last")].sort_index()
-    except Exception as exc:  # noqa: BLE001 - feature opcional, no debe romper la prediccion
-        print(f"  [warn] no se pudo obtener la serie macro ({source}/{series}): {exc}")
-        return None
+def is_stale(df: pd.DataFrame) -> bool:
+    """True si el precio no cambia en mas del 30% de las ruedas (ej. A3)."""
+    if len(df) < 2:
+        return True
+    return bool((df["close"].diff().dropna() == 0).mean() > STALE_MAX_UNCHANGED)
 
 
-def attach_macro_feature(df: pd.DataFrame, macro) -> pd.DataFrame:
-    """Alinea la serie macro al indice de `df` (ffill, nunca un valor futuro)."""
-    df = df.copy()
-    if macro is None or macro.empty:
-        df["macro_rate"] = float("nan")
-        return df
-    df["macro_rate"] = macro.reindex(df.index, method="ffill")
-    return df
+# --------------------------------------------------------------------------- #
+# Indicadores (identicos a api-ml/src/indicators.py)
+# --------------------------------------------------------------------------- #
+def _rsi_from_averages(avg_gain: float, avg_loss: float) -> float:
+    if avg_loss == 0:
+        return 50.0 if avg_gain == 0 else 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def rsi_series(close: np.ndarray, period: int = 14) -> np.ndarray:
@@ -216,17 +207,9 @@ def rsi_series(close: np.ndarray, period: int = 14) -> np.ndarray:
     out = np.full(n, np.nan)
     if n < period + 1:
         return out
-
     delta = np.diff(close)
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
-
-    def _rsi_from_averages(avg_gain: float, avg_loss: float) -> float:
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100.0 - (100.0 / (1.0 + rs))
-
     avg_gain = gain[:period].mean()
     avg_loss = loss[:period].mean()
     out[period] = _rsi_from_averages(avg_gain, avg_loss)
@@ -234,17 +217,6 @@ def rsi_series(close: np.ndarray, period: int = 14) -> np.ndarray:
         avg_gain = (avg_gain * (period - 1) + gain[i]) / period
         avg_loss = (avg_loss * (period - 1) + loss[i]) / period
         out[i + 1] = _rsi_from_averages(avg_gain, avg_loss)
-    return out
-
-
-def sma(values: np.ndarray, window: int) -> np.ndarray:
-    """Media movil simple, alineada (NaN en las primeras `window - 1` posiciones)."""
-    n = len(values)
-    out = np.full(n, np.nan)
-    if n < window:
-        return out
-    cumsum = np.cumsum(np.insert(values, 0, 0.0))
-    out[window - 1 :] = (cumsum[window:] - cumsum[:-window]) / window
     return out
 
 
@@ -265,77 +237,6 @@ def macd_histogram(close: np.ndarray, fast: int = 12, slow: int = 26, signal: in
     return macd_line - signal_line
 
 
-def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
-    """Identico a `api-ml/src/lstm.py::build_features` (LSTM/XGBoost/Transformer
-    en api-ml comparten el mismo feature engineering)."""
-    close = df["close"].to_numpy(dtype=np.float64)
-    volume = df["volume"].to_numpy(dtype=np.float64)
-    high = df["high"].to_numpy(dtype=np.float64)
-    low = df["low"].to_numpy(dtype=np.float64)
-
-    log_close = np.log(close)
-    log_return = np.diff(log_close)
-    safe_vol = np.where(volume <= 0, np.nan, volume)
-    log_volume_change = np.diff(np.log(safe_vol))
-    range_pct = ((high - low) / np.where(close == 0, np.nan, close))[1:]
-
-    rsi_norm = (rsi_series(close) - 50.0) / 50.0
-    sma20_ratio = close / sma(close, 20) - 1.0
-    macd_norm = macd_histogram(close) / np.where(close == 0, np.nan, close)
-    momentum_10 = np.full(len(close), np.nan)
-    momentum_10[10:] = log_close[10:] - log_close[:-10]
-
-    if "macro_rate" in df.columns:
-        macro_rate = df["macro_rate"].to_numpy(dtype=np.float64)
-    else:
-        macro_rate = np.full(len(close), np.nan)
-    macro_chg5 = np.full(len(close), np.nan)
-    macro_chg5[5:] = macro_rate[5:] - macro_rate[:-5]
-
-    feats = np.column_stack(
-        [
-            log_return,
-            log_volume_change,
-            range_pct,
-            rsi_norm[1:],
-            sma20_ratio[1:],
-            macd_norm[1:],
-            momentum_10[1:],
-            macro_chg5[1:],
-        ]
-    )
-
-    n_feats = len(feats)
-    target = np.full(n_feats, np.nan)
-    for j in range(n_feats):
-        d = j + 1
-        if d + horizon < len(close):
-            target[j] = log_close[d + horizon] - log_close[d]
-
-    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-    return feats, target
-
-
-def make_windows(feats: np.ndarray, target: np.ndarray, window: int):
-    xs, ys = [], []
-    for i in range(len(feats) - window):
-        y = target[i + window - 1]
-        if np.isnan(y):
-            continue
-        xs.append(feats[i : i + window])
-        ys.append(y)
-    if not xs:
-        return np.empty((0, window, feats.shape[1])), np.empty((0,))
-    return np.asarray(xs, dtype=np.float32), np.asarray(ys, dtype=np.float32)
-
-
-def flatten_windows(feats: np.ndarray, target: np.ndarray, window: int):
-    X, y = make_windows(feats, target, window)
-    if len(X) == 0:
-        return X, y
-    return X.reshape(len(X), -1), y
-
-
 def rsi(close: np.ndarray, period: int = 14):
     """RSI de Wilder sobre el ultimo valor de la serie (post-procesamiento)."""
     series = rsi_series(close, period)
@@ -344,7 +245,307 @@ def rsi(close: np.ndarray, period: int = 14):
     return float(series[-1])
 
 
-def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutral_band: float = NEUTRAL_BAND) -> dict:
+# --------------------------------------------------------------------------- #
+# Variables (identicas a api-ml/src/macro_trend.py::technical_features y
+# api-ml/src/context_trend.py)
+# --------------------------------------------------------------------------- #
+def technical_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Indicadores tecnicos de la accion."""
+    c, o, h, lo = df["close"], df["open"], df["high"], df["low"]
+    volume = df["volume"].replace(0, np.nan)
+    log_c = np.log(c)
+    r = log_c.diff()
+    f = pd.DataFrame(index=df.index)
+    for k in (1, 3, 5, 10, 20, 60, 120, 250):
+        f[f"t_ret{k}"] = log_c.diff(k)
+    down, up = (r < 0).astype(int), (r > 0).astype(int)
+    group = (down.diff() != 0).cumsum()
+    f["t_down_streak"] = down.groupby(group).cumsum() * down
+    group = (up.diff() != 0).cumsum()
+    f["t_up_streak"] = up.groupby(group).cumsum() * up
+    f["t_dd252"] = c / c.rolling(252, min_periods=60).max() - 1
+    f["t_dd60"] = c / c.rolling(60).max() - 1
+    f["t_dist_min60"] = c / c.rolling(60).min() - 1
+    f["t_new_low252"] = (c <= c.rolling(252, min_periods=60).min() * 1.0001).astype(float)
+    s20, s50 = c.rolling(20).mean(), c.rolling(50).mean()
+    s200 = c.rolling(200, min_periods=120).mean()
+    f["t_sma20"], f["t_sma50"], f["t_sma200"] = c / s20 - 1, c / s50 - 1, c / s200 - 1
+    f["t_death_cross"] = (s50 < s200).astype(float)
+    f["t_gap"] = o / c.shift() - 1
+    f["t_gap_down"] = (f["t_gap"] < -0.02).astype(float)
+    for k in (5, 20, 60):
+        f[f"t_vol{k}"] = r.rolling(k).std()
+    f["t_vol_ratio5_20"] = f["t_vol5"] / f["t_vol20"]
+    f["t_vol_ratio20_60"] = f["t_vol20"] / f["t_vol60"]
+    f["t_downdev"] = r.where(r < 0).rolling(20, min_periods=3).std() / f["t_vol20"]
+    f["t_skew20"], f["t_kurt20"] = r.rolling(20).skew(), r.rolling(20).kurt()
+    hl = np.log(h / lo.replace(0, np.nan)) ** 2
+    co = np.log(c / o.replace(0, np.nan)) ** 2
+    gk = (0.5 * hl - (2 * np.log(2) - 1) * co).clip(lower=0)
+    f["t_gk20"] = np.sqrt(gk.rolling(20).mean())
+    f["t_gk_ratio"] = np.sqrt(gk.rolling(5).mean()) / f["t_gk20"].replace(0, np.nan)
+    log_volume = np.log1p(df["volume"])
+    f["t_volz"] = (log_volume - log_volume.rolling(20).mean()) / log_volume.rolling(20).std()
+    f["t_volz_x_ret"] = f["t_volz"].fillna(0) * np.sign(r)
+    f["t_vol_chg5"] = log_volume.diff(5)
+    obv = (np.sign(r).fillna(0) * df["volume"]).cumsum()
+    f["t_obv_slope"] = (obv - obv.shift(20)) / (df["volume"].rolling(20).sum() + 1)
+    amihud = (r.abs() / (c * volume)).rolling(20).mean()
+    f["t_amihud"] = np.log1p(amihud / (amihud.rolling(250, min_periods=60).median() + 1e-12))
+    close = np.asarray(c, dtype=float)
+    f["t_rsi14"], f["t_rsi5"] = rsi_series(close), rsi_series(close, 5)
+    f["t_macd"] = macd_histogram(close) / close
+    lo14, hi14 = lo.rolling(14).min(), h.rolling(14).max()
+    f["t_stoch"] = (c - lo14) / (hi14 - lo14).replace(0, np.nan)
+    f["t_boll"] = (c - s20) / c.rolling(20).std()
+    return f.replace([np.inf, -np.inf], np.nan)
+
+
+def market_frame(histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Serie del mercado (canasta de lideres) a partir de sus historicos."""
+    closes = pd.DataFrame({s: d["close"] for s, d in histories.items() if s in LEADERS})
+    if closes.shape[1] < 3:
+        raise ValueError("faltan historicos de los lideres para armar el contexto")
+    returns = np.log(closes).diff()
+    mkt = returns.mean(axis=1).fillna(0.0)
+    index = mkt.cumsum()
+    frame = pd.DataFrame(index=closes.index)
+    frame["m_lr"] = mkt
+    for k in (5, 20, 60):
+        frame[f"m_ret{k}"] = index.diff(k)
+    frame["m_vol20"] = mkt.rolling(20).std()
+    frame["m_dd252"] = index - index.rolling(252, min_periods=100).max()
+    frame["m_breadth50"] = (closes > closes.rolling(50).mean()).where(closes.notna()).mean(axis=1)
+    return frame
+
+
+def context_features(df: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+    """Variables de contexto de una accion, alineadas a su calendario."""
+    m = market.reindex(df.index, method="ffill")
+    log_c = np.log(df["close"])
+    r = log_c.diff()
+    f = pd.DataFrame(index=df.index)
+    for k in (5, 20, 60):
+        f[f"m_ret{k}"] = m[f"m_ret{k}"]
+    f["m_vol20"], f["m_dd252"], f["m_breadth50"] = m["m_vol20"], m["m_dd252"], m["m_breadth50"]
+    for k in (5, 20, 60):
+        f[f"m_rel{k}"] = log_c.diff(k) - m[f"m_ret{k}"]
+    f["m_beta60"] = r.rolling(60).cov(m["m_lr"]) / m["m_lr"].rolling(60).var()
+    return f.replace([np.inf, -np.inf], np.nan)
+
+
+def build_features(df: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+    """Variables de una accion, en el orden de `FEATURES`."""
+    return technical_features(df).join(context_features(df, market))[FEATURES]
+
+
+def rank_against_peers(
+    own: pd.DataFrame, peer_rows: list[pd.Series], min_peers: int = MIN_PEERS
+) -> pd.DataFrame:
+    """Percentil de cada variable de `own` (1 fila) frente a los pares ese dia."""
+    if len(peer_rows) < min_peers:
+        raise ValueError(f"faltan acciones para rankear (hay {len(peer_rows)})")
+    both = pd.concat([pd.DataFrame(peer_rows)[FEATURES], own[FEATURES]], ignore_index=True)
+    ranked = both.rank(pct=True).iloc[[-1]]
+    ranked.columns = RANK_FEATURES
+    ranked.index = own.index
+    return ranked
+
+
+def peers_as_of(peers: dict[str, pd.DataFrame], asof: pd.Timestamp) -> list[pd.Series]:
+    """Ultima fila conocida de cada par hasta `asof` (ignora pares sin datos recientes)."""
+    rows = []
+    for frame in peers.values():
+        part = frame.loc[:asof]
+        if len(part) and (asof - part.index[-1]).days <= PEER_MAX_AGE_DAYS:
+            rows.append(part.iloc[-1])
+    return rows
+
+
+def build_peer_snapshot(histories: dict[str, pd.DataFrame]) -> dict:
+    """Foto de los pares para inferencia: contexto de mercado y ultimas filas de variables."""
+    market = market_frame(histories)
+    peers = {
+        symbol: build_features(df, market).tail(PEER_TAIL_ROWS)
+        for symbol, df in histories.items()
+        if len(df) >= MIN_ROWS and not is_stale(df)
+    }
+    return {
+        "market": market.tail(MARKET_TAIL_ROWS),
+        "peers": peers,
+        "as_of": market.index[-1].strftime("%Y-%m-%d"),
+        "built_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Entrenamiento
+# --------------------------------------------------------------------------- #
+def wilson_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Intervalo de confianza (95%) de una proporcion: cuanta confianza dar a una accuracy."""
+    if n == 0:
+        return 0.0, 1.0
+    p = hits / n
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
+    return float(max(0.0, center - half)), float(min(1.0, center + half))
+
+
+def build_panel(histories: dict[str, pd.DataFrame], market: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    frames = []
+    for symbol, df in histories.items():
+        f = build_features(df, market)
+        f["fwd"] = df["close"].shift(-horizon) / df["close"] - 1.0
+        f["ticker"] = symbol
+        frames.append(f)
+    panel = pd.concat(frames)
+    panel = panel[panel["fwd"].notna() & (panel["fwd"] != 0)].sort_index(kind="stable")
+    # El indice (fecha) se repite entre acciones: asignar por posicion, no con join.
+    panel[RANK_FEATURES] = panel.groupby(level=0)[FEATURES].rank(pct=True).to_numpy()
+    panel["up"] = (panel["fwd"] > 0).astype(int)
+    return panel
+
+
+def _decay_weights(index: pd.Index, cutoff: pd.Timestamp) -> np.ndarray:
+    age_years = (cutoff - pd.DatetimeIndex(index)).days.to_numpy() / 365.0
+    return 0.5 ** (age_years / HALF_LIFE_YEARS)
+
+
+def _fit_ensemble(x: np.ndarray, y: np.ndarray, weights: np.ndarray, seed: int = 0) -> list:
+    import xgboost as xgb
+
+    models = []
+    for k in range(N_SEEDS):
+        model = xgb.XGBClassifier(
+            **XGB_PARAMS, random_state=seed + k, n_jobs=4, tree_method="hist", eval_metric="logloss"
+        )
+        models.append(model.fit(x, y, sample_weight=weights))
+    return models
+
+
+def _score(models: list, x: np.ndarray) -> np.ndarray:
+    """P(sube): promedio del ensamble."""
+    return np.mean([m.predict_proba(x)[:, 1] for m in models], axis=0)
+
+
+def oos_scores(panel: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """Predicciones fuera de muestra del ultimo tramo, con reentrenos sucesivos y purga."""
+    days = np.sort(panel.index.unique())
+    first = int(len(days) * (1 - OOS_FRACTION))
+    edges = np.linspace(first, len(days), OOS_FOLDS + 1).astype(int)
+    index, x, y = panel.index.values, panel[ALL_FEATURES].to_numpy(), panel["up"].to_numpy()
+    parts = []
+    for k in range(OOS_FOLDS):
+        start = days[edges[k]]
+        end = days[edges[k + 1]] if edges[k + 1] < len(days) else None
+        purge = days[max(edges[k] - horizon, 0)]
+        tr = np.where(index <= purge)[0]
+        te = np.where((index >= start) & ((index < end) if end is not None else True))[0]
+        if len(tr) < 3000 or len(te) == 0:
+            continue
+        weights = _decay_weights(panel.index[tr], pd.Timestamp(purge))
+        models = _fit_ensemble(x[tr], y[tr], weights)
+        parts.append(
+            pd.DataFrame(
+                {"p": _score(models, x[te]), "up": y[te], "fwd": panel["fwd"].to_numpy()[te]},
+                index=panel.index[te],
+            )
+        )
+    if not parts:
+        raise ValueError("no hay historia suficiente para medir fuera de muestra")
+    return pd.concat(parts)
+
+
+def train_xgboost(histories: dict[str, pd.DataFrame], horizon: int = HORIZON) -> dict:
+    """Entrena el modelo pooled, calibra umbrales fuera de muestra y mide el candidato."""
+    from sklearn.metrics import roc_auc_score
+
+    histories = {s: d for s, d in histories.items() if len(d) >= MIN_ROWS and not is_stale(d)}
+    if not histories:
+        raise ValueError("no hay suficientes datos para entrenar")
+    market = market_frame(histories)
+    panel = build_panel(histories, market, horizon)
+    if len(panel) < 3000:
+        raise ValueError(f"muy pocas filas para entrenar ({len(panel)})")
+
+    oos = oos_scores(panel, horizon)
+    p, up = oos["p"].to_numpy(), oos["up"].to_numpy()
+    alza_thr = float(np.quantile(p, 1 - SIGNAL_QUANTILE))
+    baja_thr = float(np.quantile(p, SIGNAL_QUANTILE))
+    fwd_log = np.log1p(oos["fwd"].to_numpy())
+    is_alza, is_baja = p >= alza_thr, p <= baja_thr
+    ups, downs = fwd_log[is_alza & (fwd_log > 0)], fwd_log[is_baja & (fwd_log < 0)]
+    alza_move = float(np.median(ups)) if len(ups) else 0.0
+    baja_move = float(np.median(downs)) if len(downs) else 0.0
+    alza_hits = float(up[is_alza].mean()) if is_alza.any() else float("nan")
+    baja_hits = float(1 - up[is_baja].mean()) if is_baja.any() else float("nan")
+    base_up = float(up.mean())
+    # Un lado solo se emite si fuera de muestra le gano a su tasa base.
+    alza_off, baja_off = not alza_hits > base_up, not baja_hits > 1 - base_up
+    if alza_off:
+        alza_thr, is_alza = float("inf"), np.zeros_like(is_alza)
+    if baja_off:
+        baja_thr, is_baja = float("-inf"), np.zeros_like(is_baja)
+
+    position = np.where(is_alza, 1.0, np.where(is_baja, -1.0, 0.0))
+    predicted_move = np.where(is_alza, alza_move, np.where(is_baja, baja_move, 0.0))
+    active = position != 0
+    hits = int(np.sum(np.sign(fwd_log[active]) == position[active]))
+    n = len(fwd_log)
+    low, high = wilson_interval(hits, n)
+    metrics = {
+        # neutral cuenta como error (igual que el gate de api-ml): es la accuracy
+        # global del modelo, comparable con "siempre sube" (`base_up_rate`).
+        "directional_accuracy": hits / n,
+        "accuracy_low": low,
+        "accuracy_high": high,
+        "signal_hit_rate": float(hits / active.sum()) if active.any() else None,
+        "neutral_rate": float(np.mean(~active)),
+        "mae": float(np.mean(np.abs(predicted_move - fwd_log))),
+        "observations": n,
+        "folds": OOS_FOLDS,
+        "series": [],
+        "oos_auc": float(roc_auc_score(up, p)),
+        "base_up_rate": base_up,
+        "alza_hit_rate": None if np.isnan(alza_hits) else alza_hits,
+        "baja_hit_rate": None if np.isnan(baja_hits) else baja_hits,
+        "alza_disabled": bool(alza_off),
+        "baja_disabled": bool(baja_off),
+    }
+    weights = _decay_weights(panel.index, pd.Timestamp(panel.index.max()))
+    models = _fit_ensemble(panel[ALL_FEATURES].to_numpy(), panel["up"].to_numpy(), weights)
+    return {
+        "models": models,
+        "alza_threshold": alza_thr,
+        "baja_threshold": baja_thr,
+        "alza_move": alza_move,
+        "baja_move": baja_move,
+        "metrics": metrics,
+        "tickers": sorted(histories),
+        "horizon": horizon,
+    }
+
+
+def predict_log_return(state: dict, df: pd.DataFrame, snapshot: dict) -> tuple[str, float, float]:
+    """(senal, retorno log proyectado, P(sube)) de `df` frente a los pares de `snapshot`."""
+    asof = df.index[-1]
+    # Contexto "as of": solo filas hasta la ultima fecha de `df`.
+    market = snapshot["market"].loc[:asof]
+    if market.empty:
+        raise ValueError("la foto de pares es posterior a los datos de la accion")
+    own = build_features(df, market).iloc[[-1]]
+    ranked = rank_against_peers(own, peers_as_of(snapshot["peers"], asof))
+    row = own.join(ranked)[ALL_FEATURES].to_numpy()
+    p_up = float(_score(state["models"], row)[0])
+    if p_up >= state["alza_threshold"]:
+        return "alza", state["alza_move"], p_up
+    if p_up <= state["baja_threshold"]:
+        return "baja", state["baja_move"], p_up
+    return "neutral", 0.0, p_up
+
+
+def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutral_band: float = 0.0) -> dict:
     last_close = float(df["close"].iloc[-1])
     expected_return = float(np.expm1(log_return))
     predicted_close = float(last_close * np.exp(log_return))
@@ -381,161 +582,67 @@ def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutr
     }
 
 
-@app.function()
-def train_xgboost(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
-    import xgboost as xgb
-
-    feats, target = build_features(df, horizon)
-    X, y = flatten_windows(feats, target, WINDOW)
-    if len(X) < 30:
-        raise ValueError(
-            f"no hay suficientes ruedas para entrenar (se necesitan al menos ~{WINDOW + horizon + 30})"
-        )
-
-    booster = xgb.XGBRegressor(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        objective="reg:squarederror",
-    )
-    booster.fit(X, y, verbose=False)
-
-    return {"booster": booster}
+# --------------------------------------------------------------------------- #
+# Persistencia y cron
+# --------------------------------------------------------------------------- #
+def _dump_atomic(obj, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("wb") as fh:
+        pickle.dump(obj, fh)
+    os.replace(temporary, path)
 
 
-# Backtest walk-forward: hasta BACKTEST_FOLDS tramos consecutivos de
-# BACKTEST_FOLD_DAYS ruedas. En cada tramo el modelo se entrena SOLO con lo
-# anterior y predice desde origenes separados `horizon` ruedas (sin
-# solapamiento, asi cada caso es independiente) contra el retorno que de verdad
-# ocurrio a `horizon` ruedas. Con una sola ventana de ~60 dias el "mejor"
-# modelo era el que tuvo suerte en ese tramo; con varios tramos y casos
-# independientes la accuracy se parece mucho mas a lo que se ve en paper trading.
-BACKTEST_FOLDS = 3
-BACKTEST_FOLD_DAYS = 40
+def _load(path: Path):
+    with path.open("rb") as fh:
+        return pickle.load(fh)
 
 
-def wilson_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Intervalo de confianza (95%) de una proporcion: cuanta confianza dar a una accuracy."""
-    if n == 0:
-        return 0.0, 1.0
-    p = hits / n
-    denom = 1 + z**2 / n
-    center = (p + z**2 / (2 * n)) / denom
-    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
-    return float(max(0.0, center - half)), float(min(1.0, center + half))
+def fetch_universe_histories() -> dict[str, pd.DataFrame]:
+    histories = {}
+    for ticker in fetch_available_tickers():
+        try:
+            df, _ = clean_dataframe(fetch_ticker_history(ticker))
+            histories[ticker] = df
+        except Exception as exc:  # un ticker no cancela el resto del lote
+            print(f"  [skip] {ticker}: {exc}")
+    return histories
 
 
-def backtest_plan(n_rows: int, horizon: int, min_train: int) -> list[tuple[int, list[int]]]:
-    """[(split, [origenes])]: entrena con `[:split]`, predice desde cada origen.
-
-    Si la historia no alcanza para todos los tramos se usan menos; si no
-    alcanza ni para uno, falla (mismo criterio que antes).
-    """
-    available = (n_rows - horizon - min_train) // BACKTEST_FOLD_DAYS
-    folds = min(BACKTEST_FOLDS, available)
-    if folds < 1:
-        raise ValueError("no hay suficiente historia para el backtest temporal")
-    first_split = n_rows - horizon - folds * BACKTEST_FOLD_DAYS
-    return [
-        (split, list(range(split - 1, split - 1 + BACKTEST_FOLD_DAYS, horizon)))
-        for split in (first_split + fold * BACKTEST_FOLD_DAYS for fold in range(folds))
-    ]
+def needs_retraining(artifact: dict | None, now: datetime, every_days: int = RETRAIN_EVERY_DAYS) -> bool:
+    if artifact is None or "trained_at" not in artifact:
+        return True
+    trained_at = datetime.fromisoformat(artifact["trained_at"])
+    return (now - trained_at).days >= every_days
 
 
-def summarize_backtest(predicted, actual, evaluation_series: list[dict], folds: int, mae: float) -> dict:
-    """Metricas del backtest: accuracy con intervalo de confianza y sobre la senal real.
+def run_retraining(force: bool = False) -> dict:
+    """Refresca la foto de pares y, si hace falta, reentrena el modelo pooled."""
+    histories = fetch_universe_histories()
+    if not histories:
+        raise ValueError("no se pudo descargar data de ningun ticker")
+    snapshot = build_peer_snapshot(histories)
+    _dump_atomic(snapshot, PEERS_PATH)
 
-    `directional_accuracy` cuenta el signo de cada prediccion; `signal_hit_rate`
-    y `neutral_rate` usan la misma banda neutral que la senal que ve el usuario.
-    """
-    predicted_arr, actual_arr = np.asarray(predicted, dtype=float), np.asarray(actual, dtype=float)
-    n = len(actual_arr)
-    hits = int(np.sum(np.sign(predicted_arr) == np.sign(actual_arr)))
-    low, high = wilson_interval(hits, n)
-    expected = np.expm1(predicted_arr)
-    position = np.where(expected > NEUTRAL_BAND, 1.0, np.where(expected < -NEUTRAL_BAND, -1.0, 0.0))
-    active = position != 0
-    return {
-        "directional_accuracy": hits / n,
-        "accuracy_low": low,
-        "accuracy_high": high,
-        "signal_hit_rate": (
-            float(np.mean(np.sign(actual_arr[active]) == position[active])) if active.any() else None
-        ),
-        "neutral_rate": float(np.mean(~active)),
-        "mae": mae,
-        "observations": n,
-        "folds": folds,
-        "series": evaluation_series[-30:],
-    }
-
-
-def backtest_xgboost(df: pd.DataFrame, horizon: int) -> dict:
-    """Walk-forward: ver `backtest_plan`. El candidato nunca ve lo que evalua."""
-    plan = backtest_plan(len(df), horizon, WINDOW + horizon + 30)
-    feats, target = build_features(df, horizon)
-    predicted, actual, evaluation_series = [], [], []
-    for split, origins in plan:
-        state = train_xgboost.local(df.iloc[:split], horizon)
-        for feature_day in origins:
-            if np.isnan(target[feature_day]):
-                continue
-            window = feats[feature_day - WINDOW + 1 : feature_day + 1].reshape(1, -1)
-            predicted_return = float(state["booster"].predict(window)[0])
-            actual_return = float(target[feature_day])
-            predicted.append(predicted_return)
-            actual.append(actual_return)
-            base_day = feature_day + 1
-            future_day = base_day + horizon
-            evaluation_series.append({
-                "date": df.index[future_day].strftime("%Y-%m-%d"),
-                "predicted": float(df["close"].iloc[base_day] * np.exp(predicted_return)),
-                "actual": float(df["close"].iloc[future_day]),
-            })
-    if not actual:
-        raise ValueError("el backtest no produjo observaciones")
-    mae = float(np.mean(np.abs(np.asarray(predicted) - np.asarray(actual))))
-    return summarize_backtest(predicted, actual, evaluation_series, len(plan), mae)
-
-
-def _artifact_path(ticker: str, horizon: int) -> Path:
-    return ARTIFACT_ROOT / ticker / f"h{horizon}" / "production.pkl"
-
-
-def retrain_one(ticker: str, horizon: int) -> dict:
-    ticker = ticker.strip().upper()
-    df, repaired = clean_dataframe(fetch_ticker_history(ticker))
-    df = attach_macro_feature(df, fetch_macro_series())
-    metrics = backtest_xgboost(df, horizon)
-    path = _artifact_path(ticker, horizon)
-    incumbent_score = -1.0
-    incumbent_has_series = False
-    if path.exists():
-        with path.open("rb") as fh:
-            incumbent = pickle.load(fh)
-            incumbent_score = float(incumbent["metrics"]["directional_accuracy"])
-            incumbent_has_series = "folds" in incumbent["metrics"]  # metrica vieja: no comparable
-    promoted = metrics["directional_accuracy"] > incumbent_score or not incumbent_has_series
-    if promoted:
-        artifact = {
-            "state": train_xgboost.local(df, horizon),
-            "metrics": metrics,
-            "ticker": ticker,
-            "horizon": horizon,
-            "trained_at": datetime.now(timezone.utc).isoformat(),
-            "training_data_as_of": df.index[-1].strftime("%Y-%m-%d"),
-            "price_data_repaired_days": repaired,
-        }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        with temporary.open("wb") as fh:
-            pickle.dump(artifact, fh)
-        os.replace(temporary, path)
-        artifact_volume.commit()
-    return {"ticker": ticker, "horizon": horizon, "promoted": promoted, "metrics": metrics}
+    incumbent = _load(MODEL_PATH) if MODEL_PATH.exists() else None
+    result = {"peers": len(snapshot["peers"]), "peers_as_of": snapshot["as_of"], "promoted": False}
+    if force or needs_retraining(incumbent, datetime.now(timezone.utc)):
+        state = train_xgboost(histories)
+        result["metrics"] = state["metrics"]
+        if state["metrics"]["oos_auc"] >= MIN_AUC:
+            _dump_atomic(
+                {
+                    "state": state,
+                    "metrics": state["metrics"],
+                    "horizon": state["horizon"],
+                    "trained_at": datetime.now(timezone.utc).isoformat(),
+                    "training_data_as_of": snapshot["as_of"],
+                },
+                MODEL_PATH,
+            )
+            result["promoted"] = True
+    artifact_volume.commit()
+    return result
 
 
 @app.function(
@@ -544,50 +651,40 @@ def retrain_one(ticker: str, horizon: int) -> dict:
     schedule=modal.Cron("0 21 * * 1-5", timezone="America/Argentina/Buenos_Aires"),
     timeout=86400,
     cpu=1.0,
-    memory=1024,
+    memory=2048,
 )
-def retrain_models() -> list[dict]:
-    """Reentrena cada dia habil. Tambien se puede ejecutar a mano desde Modal."""
-    results = []
-    for ticker in fetch_available_tickers():
-        for horizon in range(MIN_HORIZON, MAX_HORIZON + 1):
-            try:
-                results.append(retrain_one(ticker, horizon))
-            except Exception as exc:  # un ticker no cancela el resto del lote
-                results.append({"ticker": ticker, "horizon": horizon, "error": str(exc)})
-    print(json.dumps(results))
-    return results
+def retrain_models() -> dict:
+    """Cada dia habil refresca los pares; reentrena el modelo cada ~4 semanas.
+
+    Tambien se puede ejecutar a mano desde Modal (`modal run ...::retrain_models`).
+    """
+    # `fetch_available_tickers()` define el universo (ver `fetch_universe_histories`).
+    result = run_retraining()
+    print(json.dumps(result, default=str))
+    return result
 
 
 @app.function(
     image=image, volumes={"/artifacts": artifact_volume}, timeout=3600,
-    cpu=1.0, memory=1024,
+    cpu=1.0, memory=2048,
 )
 @modal.fastapi_endpoint()
 def prepare(ticker: str) -> dict:
-    """Bootstrap bajo demanda: crea solamente los horizontes que faltan."""
+    """Bootstrap bajo demanda: entrena el modelo pooled solo si todavia no existe."""
     ticker = ticker.strip().upper()
     artifact_volume.reload()
-    missing = [
-        horizon for horizon in range(MIN_HORIZON, MAX_HORIZON + 1)
-        if not _artifact_path(ticker, horizon).exists()
-    ]
-    if not missing:
-        return {"ticker": ticker, "status": "ready", "trained_horizons": []}
-    results = []
-    for horizon in missing:
-        try:
-            results.append(retrain_one(ticker, horizon))
-        except Exception as exc:
-            results.append({"ticker": ticker, "horizon": horizon, "error": str(exc)})
-    return {"ticker": ticker, "status": "completed", "results": results}
+    if MODEL_PATH.exists() and PEERS_PATH.exists():
+        return {"ticker": ticker, "status": "ready", "trained": False}
+    try:
+        result = run_retraining(force=not MODEL_PATH.exists())
+    except Exception as exc:
+        return {"ticker": ticker, "status": "error", "error": str(exc)}
+    return {"ticker": ticker, "status": "completed", "trained": result["promoted"], "result": result}
 
 
-# Recursos del contenedor: 300 arboles chicos (max_depth=4) sobre ~700 filas
-# de un solo ticker. No se benchmarkeo este archivo puntual, pero se probo el
-# mismo tipo de comparacion en lstm_trend_model.py (cpu=1 vs cpu=2) y mas
-# CPU dio *peor* tiempo de respuesta para un modelo de este tamaño -- mismo
-# criterio aca, no hay motivo para esperar algo distinto con 300 arboles chicos.
+# Recursos del contenedor: 3 ensambles de 250 arboles de profundidad 2 sobre
+# una fila de variables por request. Inferencia liviana: se lee el artefacto y
+# la foto de pares del Volume y solo se descarga el historico del ticker pedido.
 # No se fija `min_containers` (default 0, escala a cero sin trafico): se
 # prioriza no pagar por contenedores idle antes que eliminar el cold start.
 @app.function(
@@ -599,35 +696,38 @@ def prepare(ticker: str) -> dict:
 )
 @modal.fastapi_endpoint()
 def main(ticker: str, horizon: int = DEFAULT_HORIZON):
-    if not (MIN_HORIZON <= horizon <= MAX_HORIZON):
-        return {"error": f"horizon debe estar entre {MIN_HORIZON} y {MAX_HORIZON} dias (se pidio {horizon})"}
+    if horizon != HORIZON:
+        return {"error": f"el modelo XGBoost v2 solo predice a {HORIZON} dias (se pidio {horizon})"}
 
     ticker = ticker.strip().upper()
     artifact_volume.reload()
-    path = _artifact_path(ticker, horizon)
-    if not path.exists():
-        return {"error": f"todavia no hay un modelo entrenado para '{ticker}' con horizonte {horizon}"}
-    with path.open("rb") as fh:
-        artifact = pickle.load(fh)
+    if not MODEL_PATH.exists() or not PEERS_PATH.exists():
+        return {"error": "todavia no hay un modelo entrenado para el universo (corre el cron o 'prepare')"}
+    artifact = _load(MODEL_PATH)
+    snapshot = _load(PEERS_PATH)
 
     df = fetch_ticker_history(ticker)
-    if len(df) < WINDOW + horizon + 30:
-        return {"error": f"se necesitan mas ruedas historicas para '{ticker}' (hay {len(df)})"}
+    if len(df) < MIN_ROWS:
+        return {"error": f"se necesitan al menos {MIN_ROWS} ruedas historicas para '{ticker}' (hay {len(df)})"}
     df, days_repaired = clean_dataframe(df)
+    if is_stale(df):
+        return {"error": f"'{ticker}' casi no tiene movimiento de precio (>30% de ruedas sin cambio)"}
 
-    macro = fetch_macro_series()
-    df = attach_macro_feature(df, macro)
-
-    feats, _ = build_features(df, horizon)
-    window = feats[-WINDOW:].reshape(1, -1)
-    log_return = float(artifact["state"]["booster"].predict(window)[0])
+    try:
+        signal, log_return, p_up = predict_log_return(artifact["state"], df, snapshot)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     result = derive_trend_output(df, log_return, horizon)
+    result["signal"] = signal  # neutral => precio proyectado = ultimo cierre
+    result["probability_up"] = round(p_up, 4)
+    result["probability_down"] = round(1 - p_up, 4)
     result["ticker"] = ticker
     result["model"] = "xgboost"
     result["source"] = "modal (artefacto preentrenado)"
     result["model_version"] = artifact["trained_at"]
     result["backtest"] = artifact["metrics"]
+    result["peers_as_of"] = snapshot["as_of"]
     if days_repaired:
         result["price_data_repaired_days"] = days_repaired
     return result

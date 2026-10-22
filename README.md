@@ -54,6 +54,18 @@ desplegado para que esto ocurra; si el Transformer no esta desplegado, el
 LSTM lo ignora y sigue. Si algun dia se libera un cron (o se pasa a un plan
 pago), se le puede volver a poner un `modal.Cron` propio.
 
+**XGBoost v2 (distinto del resto):** `xgboost_trend_model.py` ya no entrena un
+modelo por ticker y horizonte 1-5. Es UN clasificador pooled (P sube a 20
+ruedas, mismas variables y rangos cross-seccionales que `api-ml/src/xgb_trend.py`)
+y solo emite `alza`/`baja` en los extremos calibrados fuera de muestra (`neutral`
+en el resto; su accuracy global no supera a "siempre sube"). El job de las 21:00
+refresca todos los dias una foto de los pares en el Volume
+(`/artifacts/xgboost/v2/peers.pkl`) y reentrena el modelo
+(`/artifacts/xgboost/v2/production.pkl`) cada ~4 semanas, promoviendolo solo si
+el AUC fuera de muestra es >= 0.52. El endpoint solo acepta `horizon=20`.
+Los artefactos por ticker/horizonte de la v1 quedan huerfanos en el Volume y
+se pueden borrar.
+
 En cada corrida se consulta `/available-tickers` de `data-colector`: todos
 los tickers disponibles se entrenan automaticamente para los horizontes 1
 a 5. Si un ticker no tiene historia suficiente, su error queda registrado
