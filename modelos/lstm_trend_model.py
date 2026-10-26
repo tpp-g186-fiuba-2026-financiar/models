@@ -37,7 +37,7 @@ app = modal.App("lstm-trend-model")
 artifact_volume = modal.Volume.from_name("trend-model-artifacts", create_if_missing=True)
 ARTIFACT_ROOT = Path("/artifacts/lstm")
 
-DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+DATA_COLLECTOR_URL = "https://data-colector-k7h6.onrender.com"
 
 
 def _post_with_retry(url: str, timeout: int = 90, attempts: int = 4) -> requests.Response:

@@ -17,7 +17,7 @@ image = modal.Image.debian_slim().pip_install(
 app = modal.App("arima-model")
 artifact_volume = modal.Volume.from_name("arima-model-artifacts", create_if_missing=True)
 ARTIFACT_ROOT = Path("/artifacts")
-DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+DATA_COLLECTOR_URL = "https://data-colector-k7h6.onrender.com"
 MEDIA_MOVIL = 20
 BACKTEST_HORIZON = 5
 NEUTRAL_BAND = 0.01
