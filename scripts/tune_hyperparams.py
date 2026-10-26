@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+DATA_COLLECTOR_URL = "https://data-colector-k7h6.onrender.com"
 MACRO_RATE_SOURCE = "us"
 MACRO_RATE_SERIES = "TNX"
 FEATURE_NAMES = [

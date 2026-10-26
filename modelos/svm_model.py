@@ -17,7 +17,7 @@ image = modal.Image.debian_slim().pip_install(
 app = modal.App("svm-model")
 artifact_volume = modal.Volume.from_name("svm-model-artifacts", create_if_missing=True)
 ARTIFACT_ROOT = Path("/artifacts")
-DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+DATA_COLLECTOR_URL = "https://data-colector-k7h6.onrender.com"
 BACKTEST_DAYS = 60
 
 

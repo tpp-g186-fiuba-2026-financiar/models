@@ -53,7 +53,7 @@ ARTIFACT_ROOT = Path("/artifacts/xgboost")
 MODEL_PATH = ARTIFACT_ROOT / "v2" / "production.pkl"
 PEERS_PATH = ARTIFACT_ROOT / "v2" / "peers.pkl"
 
-DATA_COLLECTOR_URL = "https://data-colector.onrender.com"
+DATA_COLLECTOR_URL = "https://data-colector-k7h6.onrender.com"
 
 HORIZON = 20
 DEFAULT_HORIZON = HORIZON
