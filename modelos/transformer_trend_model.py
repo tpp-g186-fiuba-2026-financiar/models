@@ -1,20 +1,27 @@
 """Modelo Transformer de tendencia, portado a Modal desde api-ml.
 
-Mismo criterio que `lstm_trend_model.py` y `xgboost_trend_model.py` en este
-mismo directorio: misma logica de features/target base que
-`api-ml/src/transformer.py` (que reusa el feature engineering de
-`api-ml/src/lstm.py`: retornos log de precio/volumen + rango %,
-indicadores tecnicos -- RSI/SMA/MACD/momentum -- y una tasa de interes
-exogena; target = retorno log acumulado a `horizon` ruedas). La red es un
-encoder de Transformer con token [CLS] y embedding posicional aprendido.
+Copia de `api-ml/src/transformer.py` con su configuracion de produccion: un
+solo modelo para todas las acciones (no uno por ticker) que clasifica si la
+accion sube o baja **en dolares CCL** en 5 ruedas.
 
-El reentrenamiento diario (dias habiles) hace backtest, promocion y
-persistencia en un Modal Volume (lo dispara el cron del LSTM, ver
-`retrain_models`); el endpoint solo ejecuta inferencia (nunca entrena).
+- Features: las 8 de `api-ml/src/lstm.py` (retornos de precio / volumen,
+  rango, RSI, SMA, MACD, momentum y una tasa de interes) mas el cambio a 5
+  ruedas del riesgo pais, sobre los precios divididos por el CCL del dia.
+  Los retornos y el target van en unidades de volatilidad de cada accion.
+- Datos limpios: saltos de precio que el mercado no acompano (splits y canjes
+  sin ajustar) y precios <= 0, como `api-ml/src/simulacion/limpieza.py`.
+- Clasificacion balanceada: la red da el logit de "sube" y se entrena con BCE
+  con `pos_weight` = bajas / subas. El retorno esperado es `(2p - 1) x` el
+  movimiento tipico de train.
+- Walk-forward: el ultimo 15% de las fechas se parte en 3 bloques; cada uno se
+  predice con una red entrenada solo con lo anterior (cortando por fecha para
+  todas las acciones, con gap). De ahi salen las metricas y la cantidad de
+  epocas; al final se entrena con todas las fechas.
+- No predice lo que ya cotiza en dolares (GOLD, OIL y especies `D`).
 
-Igual que `xgboost_trend_model.py`, se queda con las 8 features de
-api-ml (no suma `dist_max60`/`rsi_vol_interaction`, que son propias del
-LSTM de este repo y no se validaron con esta arquitectura).
+El reentrenamiento diario (dias habiles) lo dispara el cron del LSTM (ver
+`retrain_models`) y guarda el artefacto en un Modal Volume solo si el
+walk-forward pasa el piso del gate; el endpoint solo ejecuta inferencia.
 
 Si se cambia la logica en api-ml hay que replicarla aca a mano -- es una
 copia independiente a proposito, para que esto funcione aunque el
@@ -22,6 +29,7 @@ servicio de api-ml en Render este caido.
 """
 
 import json
+import math
 import os
 import pickle
 import time
@@ -72,7 +80,8 @@ def fetch_available_tickers() -> list[str]:
         raise ValueError("data-colector no devolvio tickers disponibles")
     return sorted({str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()})
 # Las mismas 8 features que `api-ml/src/lstm.py::FEATURE_NAMES` (que usa
-# tambien el Transformer de api-ml) y que `xgboost_trend_model.py`.
+# tambien el Transformer de api-ml) y que `xgboost_trend_model.py`, mas el
+# riesgo pais (`api-ml/src/transformer.py`, opcion `riesgo_pais`).
 FEATURE_NAMES = [
     "log_return",
     "log_volume_change",
@@ -82,37 +91,44 @@ FEATURE_NAMES = [
     "macd_norm",
     "momentum_10",
     "macro_rate_chg5",
+    "riesgo_pais_chg5",
 ]
-# Hiperparametros de `api-ml/src/transformer.py::TransformerTrainConfig`
-# (ventana de 30 ruedas, d_model=32, 4 cabezas, 2 capas). Todavia no se
-# hizo una busqueda propia con backtest walk-forward para este archivo como
-# la del LSTM/XGBoost (issue #160): son los valores con los que ya corre el
-# Transformer local de api-ml.
-WINDOW = 30
-D_MODEL = 32
+# Columnas que son retornos: se dividen por la volatilidad del ticker.
+VOL_SCALED_FEATURES = ["log_return", "momentum_10"]
+# Hiperparametros de `api-ml/src/transformer.py::TransformerTrainConfig`, que
+# salen de la busqueda con Optuna de api-ml (`src/simulacion/optuna_transformer.py`,
+# trial 17): learning rate bajo y red chica.
+WINDOW = 20
+D_MODEL = 16
 NHEAD = 4
 NUM_LAYERS = 2
-DIM_FEEDFORWARD = 64
-DROPOUT = 0.1
+DIM_FEEDFORWARD = 32
+DROPOUT = 0.3593
 EPOCHS = 40
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
+BATCH_SIZE = 128
+LEARNING_RATE = 1.783e-4
+WEIGHT_DECAY = 2.083e-3
 WARMUP_EPOCHS = 3
-PATIENCE = 8
+# La mejor epoca sale entre la 1 y la 4.
+PATIENCE = 3
 VAL_FRACTION = 0.15
-# El horizonte de prediccion es un parametro de `main()`, no una constante
-# fija -- un horizonte de 10 dias predecia mejor en el backtest, pero para
-# el cliente final es poco util ("¿en 10 dias, subio o bajo?" dice poco el
-# dia a dia). Se probo 1-5 dias (rango util) y el acierto crece con el
-# horizonte dentro de ese rango tambien (51% a 1 dia, 58% a 5) -- por eso el
-# default es 5, pero queda a eleccion de quien pida la prediccion. A cambio,
-# a 1 dia el error de magnitud es mucho mas chico (0.023 vs 0.070 a 5 dias)
-# aunque acierte la direccion casi como moneda al aire.
+# Bloques del walk-forward dentro del ultimo VAL_FRACTION de las fechas.
+FOLDS = 3
+SEED = 42
+# Un solo horizonte: el modelo se entrena con todas las acciones juntas, y
+# entrenar uno por horizonte multiplicaria el tiempo del cron. El back y
+# api-ml lo piden siempre a 5 ruedas.
 DEFAULT_HORIZON = 5
-MIN_HORIZON = 1
-MAX_HORIZON = 5
 NEUTRAL_BAND = 0.01
+# Ruedas de historia por ticker para entrenar (`api-ml` settings.history_days).
+HISTORY_DAYS = 750
+MIN_RUEDAS = 60
+# Volatilidad del ticker (desvio de retornos log diarios) para escalar
+# retornos y target.
+RUEDAS_VOL = 20
+# Un ticker con mas de esta fraccion de ruedas sin cambio de precio no se usa
+# (`api-ml/src/data_quality.py`).
+STALE_MAX_UNCHANGED = 0.30
 # Tasa de interes exogena (ver `fetch_macro_series`): rendimiento a 10 anios
 # del Tesoro de EEUU, proxy de apetito por riesgo global que afecta flujos a
 # mercados emergentes (Merval incluido). La alternativa local mas relevante
@@ -120,6 +136,24 @@ NEUTRAL_BAND = 0.01
 # API que estaba caida del lado de data-colector al portar esta feature.
 MACRO_RATE_SOURCE = "us"
 MACRO_RATE_SERIES = "TNX"
+# Series del data-colector: (ruta, serie, retraso de publicacion en dias
+# calendario), como `api-ml/src/macro_data.py::SERIES`. El CCL se usa sin
+# retraso para pasar precios a dolares (se conoce al cierre del dia).
+CCL_SERIES = ("macro/argdatos", "CCL")
+RIESGO_PAIS_SERIES = ("macro/argdatos", "RIESGO_PAIS")
+RIESGO_PAIS_LAG_DAYS = 2
+
+# Panel lider (`api-ml/src/black_litterman/black_litterman.py`): mercado para
+# la limpieza de saltos y excepcion de YPFD (cotiza en pesos aunque termine en D).
+PANEL_LIDER_TICKERS = [
+    "ALUA", "BBAR", "BMA", "BYMA", "CEPU", "COME", "CRES", "EDN", "GGAL", "IRSA",
+    "LOMA", "METR", "PAMP", "SUPV", "TECO2", "TGNO4", "TGSU2", "TRAN", "TXAR", "VALO",
+    "YPFD",
+]  # fmt: skip
+# Commodities del data-colector: futuros de Yahoo, ya en dolares.
+COMMODITIES = {"GOLD", "OIL"}
+# Retorno log diario a partir del cual se sospecha un salto (x1,8 o /1,8).
+UMBRAL_SALTO = math.log(1.8)
 
 
 def fetch_ticker_history(ticker: str) -> pd.DataFrame:
@@ -141,45 +175,35 @@ def fetch_ticker_history(ticker: str) -> pd.DataFrame:
     return frame.sort_index()
 
 
-# Umbral para detectar un salto de precio que casi seguro es un error de la
-# fuente, no un movimiento real de mercado (EDA issue #135: ECOG cayo ~90%
-# en un dia -- log_return -2.31 -- con mucha menos historia que el resto,
-# huele a split mal ajustado o dato roto de Yahoo). El peor dia REAL que
-# vimos en el EDA fue un dia de elecciones, log_return ~0.34 -- este umbral
-# queda comodo por encima de eso y muy por debajo del caso roto, para no
-# tocar movimientos grandes pero legitimos.
-BAD_DATA_LOG_RETURN_THRESHOLD = 1.0
+def fetch_collector_series(route: str, series: str) -> pd.Series:
+    """Serie diaria del data-colector (`api-ml/src/macro_data.py`).
+
+    El data-colector responde 200 y manda el error en el body, por eso se
+    valida ``payload["status"]``.
+    """
+    resp = _post_with_retry(f"{DATA_COLLECTOR_URL}/{route}/{series}")
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("status") != 200:
+        reason = (payload.get("message") or {}).get("error", "error desconocido")
+        raise ValueError(f"data-colector no pudo obtener {route}/{series}: {reason}")
+    rows = payload.get("data") or []
+    if not rows:
+        raise ValueError(f"data-colector no devolvio datos para {route}/{series}")
+    values = pd.Series(
+        [float(r["value"]) for r in rows],
+        index=pd.to_datetime([int(r["ts"]) for r in rows], unit="ms").normalize(),
+    )
+    return values[~values.index.duplicated(keep="last")].sort_index()
 
 
-def clean_close_series(
-    close: np.ndarray, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD
-) -> tuple[np.ndarray, int]:
-    """Repara saltos de precio que son casi seguro un error de dato, en vez
-    de descartar el ticker entero: capa (winsoriza) cualquier retorno diario
-    mas grande que `threshold` en valor absoluto y reconstruye la serie de
-    precios a partir de esos retornos ya capados. Asi todos los indicadores
-    que se calculan mas abajo (SMA, RSI, MACD, distancia al maximo, etc.)
-    quedan sobre una serie sana, en vez de arrastrar el salto por 20-60
-    ruedas. Devuelve la serie reparada y cuantos dias se tuvieron que capar
-    (0 en el caso normal, sin nada que limpiar)."""
-    log_close = np.log(close)
-    log_return = np.diff(log_close)
-    clipped = np.clip(log_return, -threshold, threshold)
-    fixed = int(np.sum(clipped != log_return))
-    log_close_clean = np.concatenate([[log_close[0]], log_close[0] + np.cumsum(clipped)])
-    return np.exp(log_close_clean), fixed
-
-
-def clean_dataframe(df: pd.DataFrame, threshold: float = BAD_DATA_LOG_RETURN_THRESHOLD) -> tuple[pd.DataFrame, int]:
-    """Aplica `clean_close_series` sobre la columna `close` de todo el
-    historico, una sola vez -- asi todo lo que consuma `df` despues (las
-    features, el entrenamiento, el ultimo precio que se le muestra al
-    cliente, el RSI de post-procesamiento) ve la misma serie ya reparada, en
-    vez de que cada lugar tenga que acordarse de limpiarla por su cuenta."""
-    cleaned, fixed = clean_close_series(df["close"].to_numpy(dtype=np.float64), threshold)
-    df = df.copy()
-    df["close"] = cleaned
-    return df, fixed
+def fetch_ccl_y_riesgo_pais() -> tuple[pd.Series, pd.Series]:
+    """CCL (sin retraso) y riesgo pais diario con su retraso de publicacion."""
+    ccl = fetch_collector_series(*CCL_SERIES)
+    riesgo = fetch_collector_series(*RIESGO_PAIS_SERIES)
+    dias = pd.date_range(riesgo.index[0], max(riesgo.index[-1], pd.Timestamp.now().normalize()))
+    diario = riesgo.reindex(dias.union(riesgo.index)).ffill().reindex(dias)
+    return ccl, diario.shift(RIESGO_PAIS_LAG_DAYS)
 
 
 def fetch_macro_series(source: str = MACRO_RATE_SOURCE, series: str = MACRO_RATE_SERIES):
@@ -223,6 +247,97 @@ def attach_macro_feature(df: pd.DataFrame, macro) -> pd.DataFrame:
     return df
 
 
+# --------------------------------------------------------------------------- #
+# Universo y limpieza (`api-ml/src/transformer.py`, `src/simulacion/limpieza.py`)
+# --------------------------------------------------------------------------- #
+def cotiza_en_dolares(symbol: str) -> bool:
+    """Commodities y especies en dolares de BYMA (sufijo ``D``: ALUAD, A3D,
+    ...). YPFD es la excepcion: cotiza en pesos."""
+    symbol = symbol.strip().upper()
+    if symbol in COMMODITIES:
+        return True
+    return symbol.endswith("D") and symbol not in PANEL_LIDER_TICKERS
+
+
+def is_stale(df: pd.DataFrame) -> bool:
+    """True si el precio no cambia en mas del 30% de las ruedas."""
+    if len(df) < 2:
+        return True
+    return bool((df["close"].diff().dropna() == 0).mean() > STALE_MAX_UNCHANGED)
+
+
+def sin_precios_no_positivos(df: pd.DataFrame) -> pd.DataFrame:
+    """Descarta las ruedas con algun precio <= 0 (no tienen retorno log)."""
+    columnas = [c for c in ("open", "high", "low", "close") if c in df.columns]
+    return df[(df[columnas] > 0).all(axis=1)]
+
+
+def retorno_mercado(prices: dict[str, pd.DataFrame]) -> pd.Series:
+    """Mediana diaria del retorno log del panel lider (robusta a un salto aislado)."""
+    retornos = {}
+    for s in PANEL_LIDER_TICKERS:
+        if s in prices:
+            serie = np.log(prices[s]["close"]).diff()
+            serie.index = serie.index.normalize()
+            retornos[s] = serie[~serie.index.duplicated(keep="last")]
+    return pd.DataFrame(retornos).median(axis=1) if retornos else pd.Series(dtype=float)
+
+
+def detectar_saltos(df: pd.DataFrame, mercado: pd.Series) -> list[tuple[pd.Timestamp, float]]:
+    """Fechas y factores de los saltos de mas de ``UMBRAL_SALTO`` que el mercado
+    no acompano (un derrumbe general, como las PASO de 2019, no se toca)."""
+    retorno = np.log(df["close"]).diff()
+    del_mercado = mercado.reindex(retorno.index.normalize()).fillna(0.0).to_numpy()
+    relativo = retorno - del_mercado
+    es_salto = (retorno.abs() > UMBRAL_SALTO) & (relativo.abs() > UMBRAL_SALTO)
+    return [(fecha, float(np.exp(retorno[fecha]))) for fecha in retorno.index[es_salto]]
+
+
+def ajustar_salto(df: pd.DataFrame, fecha: pd.Timestamp, factor: float) -> pd.DataFrame:
+    """Ajusta las ruedas anteriores a ``fecha`` como un split de ``factor`` (copia)."""
+    df = df.copy()
+    antes = df.index < fecha
+    columnas = [c for c in ("open", "high", "low", "close") if c in df.columns]
+    df.loc[antes, columnas] = df.loc[antes, columnas] * factor
+    if "volume" in df.columns:
+        df["volume"] = df["volume"].astype(float)
+        df.loc[antes, "volume"] = df.loc[antes, "volume"] / factor
+    return df
+
+
+def limpiar(df: pd.DataFrame, mercado: pd.Series) -> pd.DataFrame:
+    df = sin_precios_no_positivos(df)
+    for fecha, factor in detectar_saltos(df, mercado):
+        df = ajustar_salto(df, fecha, factor)
+    return df
+
+
+def en_dolares(df: pd.DataFrame, ccl: pd.Series) -> pd.DataFrame:
+    """Precios divididos por el ultimo CCL conocido de cada rueda (nunca uno
+    posterior); las ruedas anteriores al primer CCL se descartan."""
+    serie = ccl.dropna().sort_index()
+    serie = serie[~serie.index.duplicated(keep="last")]
+    dias = df.index.normalize()
+    tipo = serie.reindex(serie.index.union(dias)).ffill().reindex(dias).to_numpy()
+    out = df.copy()
+    for col in ("open", "high", "low", "close"):
+        out[col] = out[col].to_numpy(dtype=np.float64) / tipo
+    return out.dropna(subset=["close"])
+
+
+def preparar(
+    df: pd.DataFrame, mercado: pd.Series, ccl: pd.Series, riesgo_pais: pd.Series | None
+) -> pd.DataFrame:
+    """OHLCV limpio, en dolares y con la columna ``riesgo_pais``."""
+    df = en_dolares(limpiar(df, mercado), ccl)
+    rp = None if riesgo_pais is None else riesgo_pais.reindex(df.index.normalize())
+    df["riesgo_pais"] = np.nan if rp is None else rp.to_numpy()
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# Features
+# --------------------------------------------------------------------------- #
 def rsi_series(close: np.ndarray, period: int = 14) -> np.ndarray:
     """RSI de Wilder, alineado a `close` (NaN en las primeras `period` posiciones)."""
     n = len(close)
@@ -279,8 +394,11 @@ def macd_histogram(close: np.ndarray, fast: int = 12, slow: int = 26, signal: in
 
 
 def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
-    """Identico a `api-ml/src/lstm.py::build_features` (LSTM/XGBoost/Transformer
-    en api-ml comparten el mismo feature engineering)."""
+    """Features y target de un OHLCV ya preparado (`preparar`), como
+    `api-ml/src/transformer.py::_features`: las 8 de `api-ml/src/lstm.py`
+    mas el riesgo pais, con los retornos y el target divididos por la
+    volatilidad del ticker. Devuelve ``(feats, target, escala)``; la fila ``j``
+    corresponde a la rueda ``df.index[j + 1]``."""
     close = df["close"].to_numpy(dtype=np.float64)
     volume = df["volume"].to_numpy(dtype=np.float64)
     high = df["high"].to_numpy(dtype=np.float64)
@@ -305,6 +423,14 @@ def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
     macro_chg5 = np.full(len(close), np.nan)
     macro_chg5[5:] = macro_rate[5:] - macro_rate[:-5]
 
+    if "riesgo_pais" in df.columns:
+        rp = df["riesgo_pais"].to_numpy(dtype=np.float64)
+    else:
+        rp = np.full(len(close), np.nan)
+    log_rp = np.log(np.where(rp > 0, rp, np.nan))
+    rp_chg5 = np.full(len(close), np.nan)
+    rp_chg5[5:] = log_rp[5:] - log_rp[:-5]
+
     feats = np.column_stack(
         [
             log_return,
@@ -315,6 +441,7 @@ def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
             macd_norm[1:],
             momentum_10[1:],
             macro_chg5[1:],
+            rp_chg5[1:],
         ]
     )
 
@@ -325,8 +452,13 @@ def build_features(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
         if d + horizon < len(close):
             target[j] = log_close[d + horizon] - log_close[d]
 
+    vol = pd.Series(log_close).diff().rolling(RUEDAS_VOL).std().to_numpy()[1:]
+    escala = np.where(vol > 0, vol, np.nan)
+    target = target / escala
+    columnas = [FEATURE_NAMES.index(c) for c in VOL_SCALED_FEATURES]
+    feats[:, columnas] = feats[:, columnas] / escala[:, None]
     feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-    return feats, target
+    return feats, target, escala
 
 
 def make_windows(feats: np.ndarray, target: np.ndarray, window: int):
@@ -340,6 +472,15 @@ def make_windows(feats: np.ndarray, target: np.ndarray, window: int):
     if not xs:
         return np.empty((0, window, feats.shape[1])), np.empty((0,))
     return np.asarray(xs, dtype=np.float32), np.asarray(ys, dtype=np.float32)
+
+
+def ventanas_con_fecha(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON):
+    """Ventanas, target y la fecha (solo el dia) de la ultima rueda de cada una."""
+    feats, target, _ = build_features(df, horizon)
+    X, y = make_windows(feats.astype(np.float32), target, WINDOW)
+    validas = [i for i in range(len(feats) - WINDOW) if not np.isnan(target[i + WINDOW - 1])]
+    fechas = df.index.normalize()[[i + WINDOW for i in validas]].to_numpy()
+    return X, y, fechas
 
 
 def rsi(close: np.ndarray, period: int = 14):
@@ -387,15 +528,16 @@ def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutr
     }
 
 
+# --------------------------------------------------------------------------- #
+# Red y entrenamiento
+# --------------------------------------------------------------------------- #
 def build_transformer_network():
-    import math
-
     import torch
     from torch import nn
 
     class _TransformerRegressor(nn.Module):
-        """Encoder de Transformer con token [CLS] para regresion de secuencias
-        (misma arquitectura que `api-ml/src/transformer.py`)."""
+        """Encoder de Transformer con token [CLS] (misma arquitectura que
+        `api-ml/src/transformer.py`); la salida es el logit de "sube"."""
 
         def __init__(self):
             super().__init__()
@@ -424,41 +566,42 @@ def build_transformer_network():
     return _TransformerRegressor()
 
 
-@app.function()
-def train_transformer(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
-    import math
+def train_transformer(
+    X: np.ndarray,
+    y: np.ndarray,
+    X_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    epochs: int | None = None,
+) -> tuple[dict, int]:
+    """Entrena una red con ventanas ya armadas (``y`` en unidades de vol).
 
+    Con validacion, early stopping por la BCE de validacion; sin validacion,
+    ``epochs`` (default ``EPOCHS``). Devuelve el estado (red y escalas) y la
+    mejor epoca (1-based).
+    """
     import torch
     from torch import nn
 
-    feats, target = build_features(df, horizon)
-    X, y = make_windows(feats, target, WINDOW)
     if len(X) < 30:
-        raise ValueError(
-            f"no hay suficientes ruedas para entrenar (se necesitan al menos ~{WINDOW + horizon + 30})"
-        )
-
-    # Split temporal (las ultimas ventanas quedan para early stopping) y
-    # normalizacion calculada solo con el set de entrenamiento.
-    split = int(len(X) * (1 - VAL_FRACTION))
-    X_train, y_train, X_val, y_val = X[:split], y[:split], X[split:], y[split:]
-    flat = X_train.reshape(-1, X_train.shape[-1])
+        raise ValueError("no hay suficientes ventanas para entrenar")
+    flat = X.reshape(-1, X.shape[-1])
     feature_mean = flat.mean(axis=0)
     feature_std = flat.std(axis=0) + 1e-8
-    target_mean = float(y_train.mean())
-    target_std = float(y_train.std() + 1e-8)
+    # Movimiento tipico (|retorno| medio en unidades de vol): pasa la
+    # probabilidad a un retorno esperado (ver `predict_transformer_state`).
+    movimiento = float(np.mean(np.abs(y)) + 1e-8)
 
     def to_tensor(values):
         return torch.tensor(values, dtype=torch.float32)
 
-    X_t = to_tensor((X_train - feature_mean) / feature_std)
-    y_t = to_tensor((y_train - target_mean) / target_std)
-    has_val = len(X_val) > 0
+    X_t = to_tensor((X - feature_mean) / feature_std)
+    y_t = to_tensor((y > 0).astype(np.float32))
+    has_val = X_val is not None and len(X_val) > 0
     if has_val:
         X_val_t = to_tensor((X_val - feature_mean) / feature_std)
-        y_val_t = to_tensor((y_val - target_mean) / target_std)
+        y_val_t = to_tensor((y_val > 0).astype(np.float32))
 
-    torch.manual_seed(42)
+    torch.manual_seed(SEED)
     net = build_transformer_network()
     optimizer = torch.optim.AdamW(net.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
@@ -471,13 +614,17 @@ def train_transformer(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
         return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    loss_fn = nn.MSELoss()
+    # BCE balanceada: sin el peso, en un periodo con mas subas aprende "siempre alza".
+    subas = float(y_t.sum().item())
+    peso = torch.tensor((len(y_t) - subas) / max(subas, 1.0))
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=peso)
 
     n = len(X_t)
     best_val = float("inf")
     best_state = None
+    best_epoch = epochs or EPOCHS
     epochs_without_improvement = 0
-    for _ in range(EPOCHS):
+    for epoch in range(epochs or EPOCHS):
         net.train()
         perm = torch.randperm(n)
         for start in range(0, n, BATCH_SIZE):
@@ -496,6 +643,7 @@ def train_transformer(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
             if val_loss < best_val - 1e-5:
                 best_val = val_loss
                 best_state = {k: v.clone() for k, v in net.state_dict().items()}
+                best_epoch = epoch + 1
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
@@ -505,155 +653,188 @@ def train_transformer(df: pd.DataFrame, horizon: int = DEFAULT_HORIZON) -> dict:
     if best_state is not None:
         net.load_state_dict(best_state)
     net.eval()
-    return {
+    state = {
         "net_state": net.state_dict(),
         "feature_mean": feature_mean,
         "feature_std": feature_std,
-        "target_mean": target_mean,
-        "target_std": target_std,
+        "movimiento": movimiento,
     }
+    return state, best_epoch
 
 
-def predict_transformer_state(state: dict, window: np.ndarray) -> float:
+def predict_transformer_state(state: dict, windows: np.ndarray) -> np.ndarray:
+    """Retorno esperado (en unidades de vol) de un batch de ventanas:
+    ``(2p - 1) * movimiento``, con ``p`` la probabilidad balanceada de suba.
+    Con ``p`` cerca de 0,5 queda dentro de la banda neutral."""
     import torch
 
-    scaled = (window - state["feature_mean"]) / state["feature_std"]
+    scaled = (windows - state["feature_mean"]) / state["feature_std"]
     net = build_transformer_network()
     net.load_state_dict(state["net_state"])
     net.eval()
     with torch.no_grad():
-        pred_scaled = float(net(torch.tensor(scaled, dtype=torch.float32)).item())
-    return pred_scaled * state["target_std"] + state["target_mean"]
+        logits = net(torch.tensor(scaled, dtype=torch.float32)).numpy()
+    return np.tanh(logits / 2) * state["movimiento"]  # tanh(z / 2) = 2 * sigmoid(z) - 1
 
 
-# Backtest walk-forward: hasta BACKTEST_FOLDS tramos consecutivos de
-# BACKTEST_FOLD_DAYS ruedas. En cada tramo el modelo se entrena SOLO con lo
-# anterior y predice desde origenes separados `horizon` ruedas (sin
-# solapamiento, asi cada caso es independiente) contra el retorno que de verdad
-# ocurrio a `horizon` ruedas. Con una sola ventana de ~60 dias el "mejor"
-# modelo era el que tuvo suerte en ese tramo; con varios tramos y casos
-# independientes la accuracy se parece mucho mas a lo que se ve en paper trading.
-BACKTEST_FOLDS = 3
-BACKTEST_FOLD_DAYS = 40
+# --------------------------------------------------------------------------- #
+# Walk-forward y metricas
+# --------------------------------------------------------------------------- #
+def bloques_walk_forward(fechas: np.ndarray, gap: int = DEFAULT_HORIZON):
+    """Bloques ``(fin_train, inicio, fin)`` comunes a todos los tickers.
 
-
-def wilson_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Intervalo de confianza (95%) de una proporcion: cuanta confianza dar a una accuracy."""
-    if n == 0:
-        return 0.0, 1.0
-    p = hits / n
-    denom = 1 + z**2 / n
-    center = (p + z**2 / (2 * n)) / denom
-    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
-    return float(max(0.0, center - half)), float(min(1.0, center + half))
-
-
-def backtest_plan(n_rows: int, horizon: int, min_train: int) -> list[tuple[int, list[int]]]:
-    """[(split, [origenes])]: entrena con `[:split]`, predice desde cada origen.
-
-    Si la historia no alcanza para todos los tramos se usan menos; si no
-    alcanza ni para uno, falla (mismo criterio que antes).
+    El ultimo ``VAL_FRACTION`` de las fechas se parte en ``FOLDS`` bloques
+    consecutivos ``[inicio, fin)``; cada uno se entrena con las fechas
+    anteriores a ``fin_train``, con ``gap`` fechas descartadas en el medio.
+    Cortar por fecha y no por ticker evita que el movimiento del mercado de
+    las fechas de validacion de un ticker se filtre por otro.
     """
-    available = (n_rows - horizon - min_train) // BACKTEST_FOLD_DAYS
-    folds = min(BACKTEST_FOLDS, available)
-    if folds < 1:
-        raise ValueError("no hay suficiente historia para el backtest temporal")
-    first_split = n_rows - horizon - folds * BACKTEST_FOLD_DAYS
-    return [
-        (split, list(range(split - 1, split - 1 + BACKTEST_FOLD_DAYS, horizon)))
-        for split in (first_split + fold * BACKTEST_FOLD_DAYS for fold in range(folds))
-    ]
+    fechas = np.unique(fechas)
+    n = len(fechas)
+    n_val = int(round(n * VAL_FRACTION))
+    if n_val == 0:
+        return []
+    folds = min(FOLDS, n_val)
+    inicios = [n - n_val + k * n_val // folds for k in range(folds)]
+    if inicios[0] - gap <= 0:
+        raise ValueError(f"muy pocas fechas ({n}) para validar {n_val} con gap {gap}")
+    finales = [fechas[i] for i in inicios[1:]] + [fechas[-1] + np.timedelta64(1, "D")]
+    return [(fechas[i - gap], fechas[i], f) for i, f in zip(inicios, finales, strict=True)]
 
 
-def summarize_backtest(predicted, actual, evaluation_series: list[dict], folds: int, mae: float) -> dict:
-    """Metricas del backtest: accuracy con intervalo de confianza y sobre la senal real.
+def acierto_balanceado(pred: np.ndarray, real: np.ndarray) -> float:
+    """Promedio del acierto en las subas y en las bajas: decir siempre lo mismo da 0,5."""
+    sube = real > 0
+    recalls = [np.mean(pred[m] > 0) if c else np.mean(pred[m] <= 0)
+               for m, c in ((sube, True), (~sube, False)) if m.any()]  # fmt: skip
+    return float(np.mean(recalls)) if recalls else float("nan")
 
-    `directional_accuracy` cuenta el signo de cada prediccion; `signal_hit_rate`
-    y `neutral_rate` usan la misma banda neutral que la senal que ve el usuario.
+
+def ic_por_fecha(pred: np.ndarray, real: np.ndarray, fechas: np.ndarray) -> float:
+    """Spearman entre prediccion y retorno real de las acciones de cada dia, promediado."""
+    df = pd.DataFrame({"pred": pred, "real": real, "fecha": fechas})
+    ics = []
+    for _, g in df.groupby("fecha"):
+        if len(g) >= 3 and g["pred"].nunique() > 1 and g["real"].nunique() > 1:
+            ics.append(g["pred"].rank().corr(g["real"].rank()))
+    return float(np.mean(ics)) if ics else float("nan")
+
+
+def entrenar_panel(ventanas: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]) -> dict:
+    """Walk-forward + reentreno final con todas las fechas.
+
+    ``ventanas``: ``{ticker: (X, y, fechas)}``. Devuelve ``{"state", "metrics"}``;
+    las metricas salen de las predicciones fuera de muestra de cada bloque.
     """
-    predicted_arr, actual_arr = np.asarray(predicted, dtype=float), np.asarray(actual, dtype=float)
-    n = len(actual_arr)
-    hits = int(np.sum(np.sign(predicted_arr) == np.sign(actual_arr)))
-    low, high = wilson_interval(hits, n)
-    expected = np.expm1(predicted_arr)
-    position = np.where(expected > NEUTRAL_BAND, 1.0, np.where(expected < -NEUTRAL_BAND, -1.0, 0.0))
-    active = position != 0
-    return {
-        "directional_accuracy": hits / n,
-        "accuracy_low": low,
-        "accuracy_high": high,
-        "signal_hit_rate": (
-            float(np.mean(np.sign(actual_arr[active]) == position[active])) if active.any() else None
-        ),
-        "neutral_rate": float(np.mean(~active)),
-        "mae": mae,
-        "observations": n,
-        "folds": folds,
-        "series": evaluation_series[-30:],
-    }
+    if not ventanas:
+        raise ValueError("no hay suficientes datos para entrenar")
+
+    def juntar(desde, hasta):
+        partes = []
+        for X, y, f in ventanas.values():
+            m = np.ones(len(f), dtype=bool)
+            if desde is not None:
+                m &= f >= desde
+            if hasta is not None:
+                m &= f < hasta
+            partes.append((X[m], y[m], f[m]))
+        return tuple(np.concatenate(cols) for cols in zip(*partes, strict=True))
+
+    todas = np.concatenate([f for _, _, f in ventanas.values()])
+    preds, reales, fechas_oos, epocas = [], [], [], []
+    for fin_train, inicio, fin in bloques_walk_forward(todas):
+        X_tr, y_tr, _ = juntar(None, fin_train)
+        X_va, y_va, f_va = juntar(inicio, fin)
+        state, mejor = train_transformer(X_tr, y_tr, X_va, y_va)
+        epocas.append(mejor)
+        preds.append(predict_transformer_state(state, X_va))
+        reales.append(y_va)
+        fechas_oos.append(f_va)
+
+    n_epocas = max(1, int(np.median(epocas))) if epocas else EPOCHS
+    X, y, _ = juntar(None, None)
+    state, _ = train_transformer(X, y, epochs=n_epocas)
+    metrics = {"folds": len(epocas), "epocas": n_epocas, "observations": 0}
+    if preds:
+        pred, real = np.concatenate(preds), np.concatenate(reales)
+        metrics.update(
+            directional_accuracy=float(np.mean(np.sign(pred) == np.sign(real))),
+            acierto_balanceado=acierto_balanceado(pred, real),
+            ic=ic_por_fecha(pred, real, np.concatenate(fechas_oos)),
+            observations=int(len(real)),
+        )
+    return {"state": state, "metrics": metrics}
 
 
-def backtest_transformer(df: pd.DataFrame, horizon: int) -> dict:
-    """Walk-forward: ver `backtest_plan`. El candidato nunca ve lo que evalua."""
-    plan = backtest_plan(len(df), horizon, WINDOW + horizon + 30)
-    feats, target = build_features(df, horizon)
-    predicted, actual, evaluation_series = [], [], []
-    for split, origins in plan:
-        state = train_transformer.local(df.iloc[:split], horizon)
-        for feature_day in origins:
-            if np.isnan(target[feature_day]):
-                continue
-            window = feats[feature_day - WINDOW + 1 : feature_day + 1][None, :, :]
-            predicted_return = predict_transformer_state(state, window)
-            actual_return = float(target[feature_day])
-            predicted.append(predicted_return)
-            actual.append(actual_return)
-            base_day = feature_day + 1
-            future_day = base_day + horizon
-            evaluation_series.append({
-                "date": df.index[future_day].strftime("%Y-%m-%d"),
-                "predicted": float(df["close"].iloc[base_day] * np.exp(predicted_return)),
-                "actual": float(df["close"].iloc[future_day]),
-            })
-    if not actual:
-        raise ValueError("el backtest no produjo observaciones")
-    mae = float(np.mean(np.abs(np.asarray(predicted) - np.asarray(actual))))
-    return summarize_backtest(predicted, actual, evaluation_series, len(plan), mae)
+def pasa_el_gate(metrics: dict) -> bool:
+    """Piso del gate (`api-ml/src/retrain_guard.py`, metrica "walk_forward"):
+    acierto balanceado fuera de muestra mayor a 0,5 e IC positivo. No se
+    compara contra el vigente: su walk-forward es de otra ventana y la
+    diferencia entre dos reentrenos seguidos es ruido."""
+    acierto, ic = metrics.get("acierto_balanceado"), metrics.get("ic")
+    return acierto is not None and acierto > 0.5 and ic is not None and ic > 0
 
 
-def _artifact_path(ticker: str, horizon: int) -> Path:
-    return ARTIFACT_ROOT / ticker / f"h{horizon}" / "production.pkl"
+# --------------------------------------------------------------------------- #
+# Reentrenamiento y endpoint
+# --------------------------------------------------------------------------- #
+def _artifact_path() -> Path:
+    return ARTIFACT_ROOT / f"h{DEFAULT_HORIZON}" / "production.pkl"
 
 
-def retrain_one(ticker: str, horizon: int) -> dict:
-    ticker = ticker.strip().upper()
-    df, repaired = clean_dataframe(fetch_ticker_history(ticker))
-    df = attach_macro_feature(df, fetch_macro_series())
-    metrics = backtest_transformer(df, horizon)
-    path = _artifact_path(ticker, horizon)
-    incumbent_score = -1.0
-    incumbent_has_series = False
-    if path.exists():
-        with path.open("rb") as fh:
-            incumbent = pickle.load(fh)
-            incumbent_score = float(incumbent["metrics"]["directional_accuracy"])
-            incumbent_has_series = "folds" in incumbent["metrics"]  # metrica vieja: no comparable
-    promoted = metrics["directional_accuracy"] > incumbent_score or not incumbent_has_series
+def historias_para_entrenar(tickers: list[str]) -> dict[str, pd.DataFrame]:
+    """Ultimas ``HISTORY_DAYS`` ruedas de cada ticker que el modelo acepta,
+    sin las series estancadas o cortas. Un ticker que falla se saltea."""
+    historias = {}
+    for ticker in tickers:
+        if cotiza_en_dolares(ticker):
+            continue
+        try:
+            df = fetch_ticker_history(ticker).iloc[-HISTORY_DAYS:]
+        except Exception as exc:  # noqa: BLE001 - se reporta y se sigue con el resto
+            print(f"  [skip] {ticker}: {exc}")
+            continue
+        if len(df) < MIN_RUEDAS or is_stale(df):
+            print(f"  [skip] {ticker}: serie corta o estancada")
+            continue
+        historias[ticker] = df
+    return historias
+
+
+def retrain() -> dict:
+    """Entrena con todas las acciones y guarda el artefacto si pasa el gate."""
+    historias = historias_para_entrenar(fetch_available_tickers())
+    macro = fetch_macro_series()
+    ccl, riesgo_pais = fetch_ccl_y_riesgo_pais()
+    positivos = {s: sin_precios_no_positivos(df) for s, df in historias.items()}
+    mercado = retorno_mercado(positivos)
+    ventanas = {}
+    for ticker, df in historias.items():
+        preparado = preparar(attach_macro_feature(df, macro), mercado, ccl, riesgo_pais)
+        X, y, fechas = ventanas_con_fecha(preparado)
+        if len(X) >= 30:
+            ventanas[ticker] = (X, y, fechas)
+    resultado = entrenar_panel(ventanas)
+    metrics = resultado["metrics"]
+    promoted = pasa_el_gate(metrics)
     if promoted:
         artifact = {
-            "state": train_transformer.local(df, horizon), "metrics": metrics,
-            "ticker": ticker, "horizon": horizon,
+            "state": resultado["state"],
+            "metrics": metrics,
+            "mercado": mercado,
+            "tickers": sorted(ventanas),
+            "horizon": DEFAULT_HORIZON,
             "trained_at": datetime.now(timezone.utc).isoformat(),
-            "training_data_as_of": df.index[-1].strftime("%Y-%m-%d"),
-            "price_data_repaired_days": repaired,
+            "training_data_as_of": str(max(df.index[-1] for df in historias.values()).date()),
         }
+        path = _artifact_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
         with temporary.open("wb") as fh:
             pickle.dump(artifact, fh)
         os.replace(temporary, path)
         artifact_volume.commit()
-    return {"ticker": ticker, "horizon": horizon, "promoted": promoted, "metrics": metrics}
+    return {"promoted": promoted, "tickers": len(ventanas), "metrics": metrics}
 
 
 # Sin `schedule=` propio a proposito: el plan gratis de Modal permite 5
@@ -664,86 +845,61 @@ def retrain_one(ticker: str, horizon: int) -> dict:
 # modelos/transformer_trend_model.py::retrain_models`.
 @app.function(
     image=image, volumes={"/artifacts": artifact_volume},
-    timeout=86400, cpu=1.0, memory=1024,
+    timeout=7200, cpu=2.0, memory=4096,
 )
-def retrain_models() -> list[dict]:
-    results = []
-    for ticker in fetch_available_tickers():
-        for horizon in range(MIN_HORIZON, MAX_HORIZON + 1):
-            try:
-                results.append(retrain_one(ticker, horizon))
-            except Exception as exc:
-                results.append({"ticker": ticker, "horizon": horizon, "error": str(exc)})
-    print(json.dumps(results))
-    return results
+def retrain_models() -> dict:
+    """Un solo modelo para todas las acciones de `fetch_available_tickers()`."""
+    try:
+        result = retrain()
+    except Exception as exc:  # noqa: BLE001 - el cron no tiene que morir sin dejar rastro
+        result = {"promoted": False, "error": str(exc)}
+    print(json.dumps(result))
+    return result
 
 
-@app.function(
-    image=image, volumes={"/artifacts": artifact_volume}, timeout=7200,
-    cpu=1.0, memory=1024,
-)
-@modal.fastapi_endpoint()
-def prepare(ticker: str) -> dict:
-    """Bootstrap bajo demanda: crea solamente los horizontes que faltan."""
-    ticker = ticker.strip().upper()
-    artifact_volume.reload()
-    missing = [
-        horizon for horizon in range(MIN_HORIZON, MAX_HORIZON + 1)
-        if not _artifact_path(ticker, horizon).exists()
-    ]
-    if not missing:
-        return {"ticker": ticker, "status": "ready", "trained_horizons": []}
-    results = []
-    for horizon in missing:
-        try:
-            results.append(retrain_one(ticker, horizon))
-        except Exception as exc:
-            results.append({"ticker": ticker, "horizon": horizon, "error": str(exc)})
-    return {"ticker": ticker, "status": "completed", "results": results}
-
-
-# Recursos del contenedor: benchmarkeado a mano (curl con tiempos, request
-# en caliente) contra cpu=2.0/memory=1024 -- contra la intuicion, quedo mas
-# LENTO (~11s en caliente) que con cpu=1.0/memory=512 (~7.6s). La red es tan
-# chica (32 neuronas) que no se beneficia de mas nucleos, y de paso sale mas
-# barato. No se fija `min_containers` (default 0, escala a cero sin
-# trafico): se prioriza no pagar por contenedores idle antes que eliminar
-# el cold start (~33s la primera vez, aceptable para este caso de uso).
+# Recursos del contenedor: la red es chica (d_model 16) y predice una sola
+# ventana, asi que no se beneficia de mas nucleos. No se fija
+# `min_containers` (default 0, escala a cero sin trafico): se prioriza no
+# pagar por contenedores idle antes que eliminar el cold start.
 @app.function(
     image=image, timeout=60, cpu=1.0, memory=512,
     volumes={"/artifacts": artifact_volume},
 )
 @modal.fastapi_endpoint()
 def main(ticker: str, horizon: int = DEFAULT_HORIZON):
-    if not (MIN_HORIZON <= horizon <= MAX_HORIZON):
-        return {"error": f"horizon debe estar entre {MIN_HORIZON} y {MAX_HORIZON} dias (se pidio {horizon})"}
+    if horizon != DEFAULT_HORIZON:
+        return {"error": f"horizon solo puede ser {DEFAULT_HORIZON} dias (se pidio {horizon})"}
 
     ticker = ticker.strip().upper()
+    if cotiza_en_dolares(ticker):
+        return {"error": f"el transformer no predice '{ticker}' (ya cotiza en dolares)"}
     artifact_volume.reload()
-    path = _artifact_path(ticker, horizon)
+    path = _artifact_path()
     if not path.exists():
-        return {"error": f"todavia no hay un modelo entrenado para '{ticker}' con horizonte {horizon}"}
+        return {"error": "todavia no hay un modelo entrenado"}
     with path.open("rb") as fh:
         artifact = pickle.load(fh)
 
-    df = fetch_ticker_history(ticker)
-    if len(df) < WINDOW + horizon + 30:
+    df = fetch_ticker_history(ticker).iloc[-HISTORY_DAYS:]
+    if len(df) < WINDOW + RUEDAS_VOL + 30:
         return {"error": f"se necesitan mas ruedas historicas para '{ticker}' (hay {len(df)})"}
-    df, days_repaired = clean_dataframe(df)
 
-    macro = fetch_macro_series()
-    df = attach_macro_feature(df, macro)
+    try:
+        ccl, riesgo_pais = fetch_ccl_y_riesgo_pais()
+    except Exception as exc:  # noqa: BLE001 - sin CCL no hay precio en dolares
+        return {"error": f"no se pudo obtener el CCL o el riesgo pais: {exc}"}
+    df_macro = attach_macro_feature(df, fetch_macro_series())
+    preparado = preparar(df_macro, artifact["mercado"], ccl, riesgo_pais)
+    feats, _, escala = build_features(preparado, horizon)
+    if len(feats) < WINDOW or not np.isfinite(escala[-1]):
+        return {"error": f"se necesitan mas ruedas historicas para '{ticker}' (hay {len(df)})"}
+    expected = float(predict_transformer_state(artifact["state"], feats[-WINDOW:][None, :, :])[0])
 
-    feats, _ = build_features(df, horizon)
-    window = feats[-WINDOW:][None, :, :]
-    log_return = predict_transformer_state(artifact["state"], window)
-
-    result = derive_trend_output(df, log_return, horizon)
+    # Retorno en dolares: el precio esperado se informa en pesos, a CCL constante.
+    result = derive_trend_output(df, expected * float(escala[-1]), horizon)
     result["ticker"] = ticker
     result["model"] = "transformer"
     result["source"] = "modal (artefacto preentrenado)"
     result["model_version"] = artifact["trained_at"]
     result["backtest"] = artifact["metrics"]
-    if days_repaired:
-        result["price_data_repaired_days"] = days_repaired
     return result
