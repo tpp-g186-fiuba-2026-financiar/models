@@ -54,6 +54,18 @@ desplegado para que esto ocurra; si el Transformer no esta desplegado, el
 LSTM lo ignora y sigue. Si algun dia se libera un cron (o se pasa a un plan
 pago), se le puede volver a poner un `modal.Cron` propio.
 
+**Transformer (distinto del resto):** copia de `api-ml/src/transformer.py`. Es
+UN modelo para todas las acciones (no uno por ticker) que clasifica si la
+accion sube o baja **en dolares CCL** a 5 ruedas (solo ese horizonte), con el
+riesgo pais como feature extra, limpieza de splits sin ajustar y clasificacion
+balanceada. Valida con walk-forward (3 bloques del ultimo 15% de las fechas,
+cortados por fecha para todas las acciones) y al final entrena con todo; se
+guarda si el acierto balanceado fuera de muestra supera 0,5 y el IC es
+positivo. Necesita el CCL y el riesgo pais del data-colector (`macro/argdatos`)
+para entrenar y para predecir. No predice GOLD, OIL ni las especies en
+dolares (sufijo `D`, salvo YPFD); el precio esperado se informa en pesos, a
+CCL constante.
+
 **XGBoost v2 (distinto del resto):** `xgboost_trend_model.py` ya no entrena un
 modelo por ticker y horizonte 1-5. Es UN clasificador pooled (P sube a 20
 ruedas, mismas variables y rangos cross-seccionales que `api-ml/src/xgb_trend.py`)
@@ -109,8 +121,9 @@ https://financiar186--transformer-trend-model-main-dev.modal.run/?ticker=GGAL
 ```
 
 El endpoint solo hace feature engineering e inferencia. Nunca entrena. Si
-todavia no existe un artefacto para el ticker/horizonte pedido responde un
-error inmediato en vez de bloquear la API durante minutos.
+todavia no existe un artefacto para el ticker/horizonte pedido (en el
+Transformer, el modelo entero) responde un error inmediato en vez de
+bloquear la API durante minutos.
 
 ## Seguimiento operativo
 

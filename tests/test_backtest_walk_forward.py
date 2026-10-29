@@ -1,4 +1,4 @@
-"""Tests del backtest walk-forward compartido por ARIMA, LSTM y Transformer.
+"""Tests del backtest walk-forward compartido por ARIMA y LSTM.
 
 Sin red ni Modal. Lo que se verifica es lo que hace que el backtest sirva para
 comparar modelos: que nunca entrene con datos que despues evalua, que cada
@@ -11,9 +11,8 @@ import pytest
 
 import arima_model
 import lstm_trend_model as lstm
-import transformer_trend_model as transformer
 
-PLAN_MODULES = [arima_model, lstm, transformer]
+PLAN_MODULES = [arima_model, lstm]
 
 
 def _history(n: int = 420, seed: int = 0) -> pd.DataFrame:
@@ -119,7 +118,6 @@ def test_arima_backtest_on_pure_noise_is_not_inflated():
     "module, name, trainer, predictor",
     [
         (lstm, "backtest_lstm", "train_lstm", "predict_lstm_state"),
-        (transformer, "backtest_transformer", "train_transformer", "predict_transformer_state"),
     ],
 )
 def test_neural_backtests_wire_the_same_walk_forward(monkeypatch, module, name, trainer, predictor):
