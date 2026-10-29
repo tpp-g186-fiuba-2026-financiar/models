@@ -531,22 +531,40 @@ def derive_trend_output(df: pd.DataFrame, log_return: float, horizon: int, neutr
 # --------------------------------------------------------------------------- #
 # Red y entrenamiento
 # --------------------------------------------------------------------------- #
+def sinusoidal_encoding(max_len: int, d_model: int):
+    """Encoding posicional fijo de "Attention is all you need" (como
+    `api-ml/src/transformer.py::_SinusoidalPositionalEncoding`):
+    ``PE(p, 2i) = sin(p / 10000^(2i/d))``, ``PE(p, 2i+1) = cos(p / 10000^(2i/d))``.
+    La posicion 0 es el token [CLS]; las siguientes, los dias de la ventana."""
+    import torch
+
+    posicion = torch.arange(max_len, dtype=torch.float32)[:, None]
+    frecuencia = torch.exp(
+        torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+    )
+    pe = torch.zeros(1, max_len, d_model)
+    pe[0, :, 0::2] = torch.sin(posicion * frecuencia)
+    pe[0, :, 1::2] = torch.cos(posicion * frecuencia)[:, : d_model // 2]
+    return pe
+
+
 def build_transformer_network():
     import torch
     from torch import nn
 
     class _TransformerRegressor(nn.Module):
-        """Encoder de Transformer con token [CLS] (misma arquitectura que
-        `api-ml/src/transformer.py`); la salida es el logit de "sube"."""
+        """Encoder de Transformer con token [CLS] y encoding posicional
+        sinusoidal (misma arquitectura que `api-ml/src/transformer.py`); la
+        salida es el logit de "sube"."""
 
         def __init__(self):
             super().__init__()
             self.input_proj = nn.Linear(len(FEATURE_NAMES), D_MODEL)
             self.cls_token = nn.Parameter(torch.zeros(1, 1, D_MODEL))
             nn.init.trunc_normal_(self.cls_token, std=0.02)
-            # +1 por el token [CLS] que se antepone a la secuencia.
-            self.pos_embedding = nn.Parameter(torch.zeros(1, WINDOW + 1, D_MODEL))
-            nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+            # +1 por el token [CLS] que se antepone a la secuencia. Fijo, no se
+            # entrena ni se guarda en el artefacto (ver `sinusoidal_encoding`).
+            self.register_buffer("pe", sinusoidal_encoding(WINDOW + 1, D_MODEL), persistent=False)
             layer = nn.TransformerEncoderLayer(
                 d_model=D_MODEL, nhead=NHEAD, dim_feedforward=DIM_FEEDFORWARD,
                 dropout=DROPOUT, batch_first=True, activation="gelu",
@@ -559,7 +577,7 @@ def build_transformer_network():
             h = self.input_proj(x) * math.sqrt(D_MODEL)
             cls = self.cls_token.expand(x.size(0), -1, -1)
             h = torch.cat([cls, h], dim=1)
-            h = h + self.pos_embedding[:, : h.size(1), :]
+            h = h + self.pe[:, : h.size(1), :]
             h = self.encoder(h)
             return self.head(self.norm(h[:, 0, :])).squeeze(-1)
 

@@ -103,6 +103,18 @@ def test_cotiza_en_dolares():
     assert not tm.cotiza_en_dolares("YPFD") and not tm.cotiza_en_dolares("GGAL")
 
 
+def test_encoding_posicional_sinusoidal_fijo():
+    import torch
+
+    pe = tm.sinusoidal_encoding(tm.WINDOW + 1, tm.D_MODEL)[0]
+    assert torch.allclose(pe[0, 0::2], torch.zeros(tm.D_MODEL // 2))
+    assert torch.allclose(pe[0, 1::2], torch.ones(tm.D_MODEL // 2))
+    assert pe[1, 0].item() == pytest.approx(np.sin(1.0), abs=1e-6)
+    net = tm.build_transformer_network()
+    assert "pe" not in net.state_dict()
+    assert all(p.shape != pe.shape for p in net.parameters())
+
+
 def test_network_forward_shape():
     import torch
 
